@@ -390,9 +390,16 @@ class RodBC(RodBCBase, Rod):
         self.filename = filename
         super().__init__(h)
 
+class RodComplexBC(RodBCBase, RodComplex):
+    def __init__(self, h, meshes = [], transforms = [], static_meshes:StaticScene = None):
+        self.meshes_filename = meshes 
+        self.transforms = transforms
+        super().__init__(h)
+        
 def drape():
     # rod = RodBC(h, "assets/elephant.mesh")
-    rod = RodBC(h)
+    # rod = RodBC(h)
+    rod = RodComplexBC(h, meshes = ["assets/bar2.tobj"], transforms = [np.eye(4)])
     viewer = PSViewer(rod)
     ps.set_user_callback(viewer.callback)
     ps.set_ground_plane_mode("none")

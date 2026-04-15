@@ -161,7 +161,104 @@ def verify_normals(verts: wp.array(dtype = vec3), normals: wp.array(dtype = vec3
     n = plane_normal(verts[i0], verts[i1], verts[i2])
     normals[i] = n
 
-class TOBJComplex:
+
+@wp.struct 
+class Soup: 
+    xcs: wp.array(dtype = vec3)
+    triangles: wp.array(dtype = int)
+    edges: wp.array(dtype = int)
+    body: wp.array(dtype = int)
+    x_transformed: wp.array(dtype = vec3)
+
+
+class SimComplexBase:
+    def __init__(self): 
+        self.n_nodes = 0
+        V = np.zeros((0, 3), dtype = float)
+        F_from_file = np.zeros((0, 3), dtype = int)
+        F = np.zeros((0, 3), dtype = int)
+        E = np.zeros((0, 2), dtype = int)
+        B = np.zeros(0, dtype = int)
+        R = np.zeros((0,), dtype = float)
+        T = np.zeros((0, 4), dtype = int)
+        body_idx = 0
+
+        for nxt in self.get_next_object():
+            v, e, ff, t, r = nxt
+            b = np.ones((v.shape[0],), dtype = int) * body_idx
+            V = np.vstack((V, v))
+            E = np.vstack((E, e + self.n_nodes))
+            B = np.hstack((B, b))
+            R = np.hstack((R, r))
+            T = np.vstack((T, t + self.n_nodes))
+            if ff.shape[0]:
+                F_from_file = np.vstack([F_from_file, ff + self.n_nodes])
+
+            self.n_nodes += v.shape[0]
+            body_idx += 1
+
+        self.xcs = wp.zeros((self.n_nodes), dtype = vec3) 
+        self.xcs.assign(V)
+
+        F = np.vstack([F, F_from_file])
+        self.indices = wp.array(F.reshape(-1), dtype = int)        
+        self.edges = wp.array(E.reshape(-1), dtype = int)
+        self.body = wp.array(B, dtype = int)
+        
+
+        geom = Soup()
+        geom.xcs = self.xcs
+        geom.triangles = self.indices
+        geom.body = self.body
+        geom.edges = self.edges
+        geom.x_transformed = wp.zeros_like(self.xcs)
+        self.soup = geom
+
+        self.V = V
+        self.F = F
+        self.E = E
+        self.n_bodies = body_idx
+        self.R = R
+
+        self.n_tets = T.shape[0]
+        self.T = wp.zeros((self.n_tets, 4), dtype = int)
+        self.T.assign(T)
+
+    def get_next_object(self):
+        return []
+
+
+class TOBJComplex(SimComplexBase):
+    def __init__(self):
+        super().__init__()
+    def get_next_object(self):
+        
+        transforms = self.transforms 
+        meshes_filename = self.meshes_filename
+
+        for f, trans in zip(meshes_filename, transforms):
+            if f.endswith(".tobj"):
+                v, t = import_tobj(f)
+                ff = igl.boundary_facets(t)  
+                ff, _ = igl.bfs_orient(ff)
+                c, _ = igl.orientable_patches(ff)
+                F, _ = igl.orient_outward(v, ff, c)
+
+            elif f.endswith(".mesh"):
+                v, t, _ = igl.read_mesh(f)
+                ff = np.zeros((0, 3), int)
+            elif f.endswith(".obj"):
+                v, tc, _, ff, _, _ = igl.read_obj(f)
+                t = np.zeros((0, 4), int)
+                if tc is not None and tc.shape[0]:
+                    if tc.shape[1] == 2:
+                        tc = np.hstack((tc, np.zeros((tc.shape[0], 1), dtype = scalar)))
+                    uv = np.vstack((uv, tc))
+
+            e = igl.edges(ff)
+            yield v, e, ff, t, None
+
+class _TOBJComplex:
     def __init__(self):
         '''
         form a complex of all simulation meshes and exposes tet geometry interface 
