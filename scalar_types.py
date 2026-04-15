@@ -1,15 +1,20 @@
 import warp as wp 
-
+mat22 = wp.mat22d
 mat33 = wp.mat33d
 mat44 = wp.mat44d
 vec4 = wp.vec4d
 vec3 = wp.vec3d
+vec2 = wp.vec2d
 scalar = wp.float64
 quat = wp.quatd
 mat6 = wp.spatial_matrixd
 vec6 = wp.spatial_vectord
-vec2 = wp.vec2d
-mat22 = wp.mat22d
-@wp.func
-def make_vec6(v3: vec3, w3: vec3):
-    return vec6(v3[0], v3[1], v3[2], w3[0], w3[1], w3[2])
+
+mat34 = wp.types.matrix(shape = (3, 4), dtype = scalar)
+mat24 = wp.types.matrix(shape = (2, 4), dtype = scalar)
+mat12 = wp.types.matrix(shape = (12, 12), dtype = scalar)
+mat99 = wp.types.matrix(shape = (9, 9), dtype = scalar)
+vec12 = wp.types.vector(length = 12, dtype = scalar)
+@wp.func 
+def make_vec6(v: vec3, w: vec3) -> vec6:
+    return vec6(v[0], v[1], v[2], w[0], w[1], w[2]) 

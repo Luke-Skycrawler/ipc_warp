@@ -1,0 +1,3 @@
+[submodule "ipctkwp"]
+	path = ipctkwp
+	url = git@github.com:Luke-Skycrawler/ipctk_warp.git

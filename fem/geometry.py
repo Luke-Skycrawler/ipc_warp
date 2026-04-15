@@ -211,7 +211,7 @@ class SimComplexBase:
         geom.triangles = self.indices
         geom.body = self.body
         geom.edges = self.edges
-        geom.x_transformed = wp.zeros_like(self.xcs)
+        # geom.x_transformed = wp.zeros_like(self.xcs)
         self.soup = geom
 
         self.V = V

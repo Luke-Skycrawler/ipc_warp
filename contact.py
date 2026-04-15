@@ -1,9 +1,8 @@
 import warp as wp 
 import numpy as np 
-from quat_util import vec3, vec4, mat33, mat44, scalar, Rq
-from geometry import Soup
-from BDF1 import BDFHistory
-
+from scalar_types import *
+from fem.geometry import Soup
+from fem.params import NewtonState
 _thickness = 0.01
 contact_volume = 10000
 # buffer = 0.01
@@ -11,6 +10,7 @@ buffer = _thickness
 eps = 1e-6
 FLT_MAX = 1e5
 ZERO = 1e-6
+enable_self_collision = False
 
 '''
 TODO: make sure max_unroll = 0 before importing this module
@@ -68,18 +68,9 @@ class ContactRet:
     points: wp.array(dtype = vec3)
     dists: wp.array(dtype = scalar)
 
-@wp.func
-def fetch_b0b1(c: XConstraint, soup: Soup):
-    i0 = c.a1a2b1b2[0]
-    i2 = c.a1a2b1b2[2]
-    
-    b0 = soup.body[i0]
-    b1 = soup.body[i2]
-
-    return b0, b1
 
 @wp.func 
-def fetch_dist_n_r0r1(p0: BDFHistory, p1: BDFHistory, soup: Soup, c: XConstraint):
+def fetch_dist_v0v1(p: NewtonState, soup: Soup, c: XConstraint):
     l0 = c.l0
     i0 = c.a1a2b1b2[0]
     i1 = c.a1a2b1b2[1]
@@ -89,37 +80,25 @@ def fetch_dist_n_r0r1(p0: BDFHistory, p1: BDFHistory, soup: Soup, c: XConstraint
     b0 = soup.body[i0]
     b1 = soup.body[i2]
 
-    R0 = Rq(p0.nxt.q)
-    R1 = Rq(p1.nxt.q)
-    
-    c0 = p0.nxt.c
-    c1 = p1.nxt.c
-    
-    x0 = R0 @ soup.xcs[i0] + c0
-    x1 = R0 @ soup.xcs[i1] + c0
-    x2 = R1 @ soup.xcs[i2] + c1
-    x3 = R1 @ soup.xcs[i3] + c1
+    x0 = soup.x_transformed[i0]
+    x1 = soup.x_transformed[i1]
+    x2 = soup.x_transformed[i2]
+    x3 = soup.x_transformed[i3]
 
     dab = wp.closest_point_edge_edge(wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3), eps)
     v0 = wp.lerp(x0, x1, scalar(dab[0]))
     v1 = wp.lerp(x2, x3, scalar(dab[1]))
 
-    v10 = v0 - v1
     dist = scalar(dab[2])
 
-    n = v10 / dist
-    
-    r1 = v0 - c0 
-    r2 = v1 - c1
-
-    return dist, n, r1, r2
+    return dist, v0, v1
 
 @wp.func 
 def triangle_normal(x0: vec3, x1: vec3, x2: vec3):
     return wp.normalize(wp.cross(x1 - x0, x2 - x0))
 
 @wp.func 
-def fetch_dist_n_r0r1_pt(p0: BDFHistory, p1: BDFHistory, soup: Soup, c: XConstraint):
+def fetch_dist_v0v1_pt(p: NewtonState, soup: Soup, c: XConstraint):
     '''
     i, t0, t1, t2 
     '''
@@ -132,16 +111,11 @@ def fetch_dist_n_r0r1_pt(p0: BDFHistory, p1: BDFHistory, soup: Soup, c: XConstra
     t1 = c.a1a2b1b2[2]
     t2 = c.a1a2b1b2[3]
     
-    R0 = Rq(p0.nxt.q)
-    R1 = Rq(p1.nxt.q)
     
-    c0 = p0.nxt.c
-    c1 = p1.nxt.c
-    
-    x0 = R0 @ soup.xcs[i] + c0
-    x1 = R1 @ soup.xcs[t0] + c1
-    x2 = R1 @ soup.xcs[t1] + c1
-    x3 = R1 @ soup.xcs[t2] + c1
+    x0 = soup.x_transformed[i]
+    x1 = soup.x_transformed[t0]
+    x2 = soup.x_transformed[t1]
+    x3 = soup.x_transformed[t2]
 
     dab, type = closest_point_triangle(wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3))
 
@@ -150,39 +124,24 @@ def fetch_dist_n_r0r1_pt(p0: BDFHistory, p1: BDFHistory, soup: Soup, c: XConstra
     beta = scalar(dab[1])
     v1 = alpha * x1 + beta * x2 + (scalar(1.0) - alpha - beta) * x3
 
-    v10 = v0 - v1
     dist = scalar(dab[2])
 
-    n = vec3(v10 / dist)
-    
-    r1 = v0 - c0 
-    r2 = v1 - c1
-
-    # normal = triangle_normal(x1, x2, x3)
-    # if wp.dot(normal, v10) > scalar(0.0) and z < alpha < o and z < beta < o and alpha + beta < o:
-    # if wp.dot(normal, v10) > scalar(0.0) and type == 6:
-    #     n = -n
-    #     dist = -dist
-
-    return dist, n, r1, r2
-
+    return dist, v0, v1
 
 @wp.kernel
-def get_contact_points(p: wp.array(dtype = BDFHistory), soup: Soup, xconstraints: wp.array(dtype = XConstraint), contact_ret: ContactRet):
+def get_contact_points(p: NewtonState, soup: Soup, xconstraints: wp.array(dtype = XConstraint), contact_ret: ContactRet):
     i = wp.tid()
     c = xconstraints[i]
-    b0, b1 = fetch_b0b1(c, soup)
-    dist, n, r1, r2 = fetch_dist_n_r0r1(p[b0], p[b1], soup, c)
-    contact_ret.points[i] = (p[b0].nxt.c + r1 + p[b1].nxt.c + r2) * scalar(0.5)
+    dist, v0, v1 = fetch_dist_v0v1(p, soup, c)
+    contact_ret.points[i] = (v0 + v1) * scalar(0.5)
     contact_ret.dists[i] = dist
 
 @wp.kernel
-def get_contact_points_pt(p: wp.array(dtype = BDFHistory), soup: Soup, xconstraints: wp.array(dtype = XConstraint), contact_ret: ContactRet):
+def get_contact_points_pt(p: NewtonState, soup: Soup, xconstraints: wp.array(dtype = XConstraint), contact_ret: ContactRet):
     i = wp.tid()
     c = xconstraints[i]
-    b0, b1 = fetch_b0b1(c, soup)
-    dist, n, r1, r2 = fetch_dist_n_r0r1_pt(p[b0], p[b1], soup, c)
-    contact_ret.points[i] = (p[b0].nxt.c + r1 + p[b1].nxt.c + r2) * scalar(0.5)
+    dist, v0, v1 = fetch_dist_v0v1_pt(p, soup, c)
+    contact_ret.points[i] = (v0 + v1) * scalar(0.5)
     contact_ret.dists[i] = dist
 
 @wp.func
@@ -219,8 +178,10 @@ def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thicknes
         j = int(0) 
         while wp.bvh_query_next(query, j):
             connected = soup.edges[i * 2] == soup.edges[j * 2] or soup.edges[i * 2] == soup.edges[j * 2 + 1] or soup.edges[i * 2 + 1] == soup.edges[j * 2] or soup.edges[i * 2 + 1] == soup.edges[j * 2 + 1]
-            
-            self_collision = soup.body[a1] == soup.body[soup.edges[j * 2]]
+
+            self_collision = False
+            if wp.static(enable_self_collision):
+                self_collision = soup.body[a1] == soup.body[soup.edges[j * 2]]
             if i < j and not connected and not self_collision: 
                 b1 = soup.edges[j * 2]
                 b2 = soup.edges[j * 2 + 1]
@@ -319,7 +280,10 @@ def point_triangle_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thi
         while wp.mesh_query_aabb_next(query, j):
             connected = soup.triangles[j * 3] == i or soup.triangles[j * 3 + 1] == i or soup.triangles[j * 3 + 2] == i
 
-            self_collision = soup.body[i] == soup.body[soup.triangles[j * 3]]
+            self_collision = False
+            if wp.static(enable_self_collision):
+                self_collision = soup.body[i] == soup.body[soup.triangles[j * 3]]
+            
             if not connected and not self_collision: 
                 t1 = soup.triangles[j * 3]
                 t2 = soup.triangles[j * 3 + 1]

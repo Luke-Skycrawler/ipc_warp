@@ -37,3 +37,13 @@ class FEMMesh:
     xcs: wp.array(dtype = vec3)
     T: wp.array2d(dtype = int)
     indices: wp.array(dtype = int)
+
+
+@wp.struct 
+class NewtonState: 
+    x: wp.array(dtype = vec3)
+    x0: wp.array(dtype = vec3)
+    dx: wp.array(dtype = vec3)
+    xdot: wp.array(dtype = vec3)
+    M: wp.array(dtype = scalar)
+    Psi: wp.array(dtype = scalar)

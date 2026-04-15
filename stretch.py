@@ -3,7 +3,7 @@ import polyscope.imgui as gui
 import numpy as np
 import warp as wp 
 from fem.interface import Rod, default_tobj, RodComplex
-from fem.params import model
+from fem.params import NewtonState
 import igl
 from warp.sparse import *
 from fem.params import FEMMesh, mu, lam, gravity, gravity_np
@@ -12,24 +12,27 @@ from warp.optim.linear import bicgstab, cg
 from geometry.static_scene import StaticScene
 from warp.fem.linalg import array_axpy
 from scalar_types import *
+from contact import ContactSolverBase, XConstraint, fetch_dist_v0v1, fetch_dist_v0v1_pt
+
+from ipctkwp.distance.edge_edge import x_to_grad_psd_hess_ee
+from ipctkwp.distance.point_triangle import x_to_grad_psd_hess_pt
+from ipctkwp.distance.point_edge import point_edge_distance_gradient_hessian
+
+from fem.geometry import Soup
+
 eps = 3e-4
 h = 1e-2
 rho = 1e3
 omega = 3.0
-boundary_v = 0.0
+boundary_v = 1.0
 
 quasi_static = False
 twist = True
 attachment_stiffness = scalar(1e8)
 
-@wp.struct 
-class NewtonState: 
-    x: wp.array(dtype = vec3)
-    x0: wp.array(dtype = vec3)
-    dx: wp.array(dtype = vec3)
-    xdot: wp.array(dtype = vec3)
-    M: wp.array(dtype = scalar)
-    Psi: wp.array(dtype = scalar)
+contact_stiffness = scalar(1e5)
+wp.config.max_unroll = 1
+wp.config.enable_backward = False
 
 @wp.kernel
 def set_M_diag(d: wp.array(dtype = scalar), M: wp.array(dtype = mat33)):  
@@ -390,11 +393,96 @@ class RodBC(RodBCBase, Rod):
         self.filename = filename
         super().__init__(h)
 
-class RodComplexBC(RodBCBase, RodComplex):
+@wp.kernel
+def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), triplets: Triplets, b: wp.array(dtype = vec3)):
+    i = wp.tid()
+    c = contacts[i]
+    
+    dist, v0, v1 = fetch_dist_v0v1(states, soup, c)
+    
+    if dist < c.l0:
+        x0 = states.x[c.a1a2b1b2[0]]
+        x1 = states.x[c.a1a2b1b2[1]]
+        x2 = states.x[c.a1a2b1b2[2]]
+        x3 = states.x[c.a1a2b1b2[3]]
+        grad, hess = x_to_grad_psd_hess_ee(x0, x1, x2, x3)
+
+        grad *= contact_stiffness
+        hess *= contact_stiffness
+
+        for ii in range(4):
+            gii = vec3(grad[ii * 3 + 0], grad[ii * 3 + 1], grad[ii * 3 + 2])
+            wp.atomic_add(b, c.a1a2b1b2[ii], gii)
+            for jj in range(4): 
+                triplets.rows[i * 16 + ii * 4 + jj] = c.a1a2b1b2[ii]
+                triplets.cols[i * 16 + ii * 4 + jj] = c.a1a2b1b2[jj]
+                block = mat33(
+                    hess[ii * 3 + 0, jj * 3 + 0], hess[ii * 3 + 0, jj * 3 + 1], hess[ii * 3 + 0, jj * 3 + 2],
+                    hess[ii * 3 + 1, jj * 3 + 0], hess[ii * 3 + 1, jj * 3 + 1], hess[ii * 3 + 1, jj * 3 + 2],
+                    hess[ii * 3 + 2, jj * 3 + 0], hess[ii * 3 + 2, jj * 3 + 1], hess[ii * 3 + 2, jj * 3 + 2]
+                )
+                triplets.vals[i * 16 + ii * 4 + jj] = block
+
+@wp.kernel
+def contact_hessian_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), triplets: Triplets, b: wp.array(dtype = vec3), offset: int):
+    i = wp.tid()
+    c = contacts[i]
+    
+    dist, v0, v1 = fetch_dist_v0v1_pt(states, soup, c)
+    
+    if dist < c.l0:
+        i0 = c.a1a2b1b2[0]
+        i1 = c.a1a2b1b2[1]
+        i2 = c.a1a2b1b2[2]
+        i3 = c.a1a2b1b2[3]
+        x0 = states.x[i0]
+        x1 = states.x[i1]
+        x2 = states.x[i2]
+        x3 = states.x[i3]
+        grad, hess = x_to_grad_psd_hess_pt(x0, x1, x2, x3)
+
+        grad *= contact_stiffness
+        hess *= contact_stiffness
+
+        for ii in range(4):
+            gii = vec3(grad[ii * 3 + 0], grad[ii * 3 + 1], grad[ii * 3 + 2])
+            wp.atomic_add(b, c.a1a2b1b2[ii], gii)
+            for jj in range(4): 
+                idx = (offset + i) * 16 + ii * 4 + jj
+                triplets.rows[idx] = c.a1a2b1b2[ii]
+                triplets.cols[idx] = c.a1a2b1b2[jj]
+                block = mat33(
+                    hess[ii * 3 + 0, jj * 3 + 0], hess[ii * 3 + 0, jj * 3 + 1], hess[ii * 3 + 0, jj * 3 + 2],
+                    hess[ii * 3 + 1, jj * 3 + 0], hess[ii * 3 + 1, jj * 3 + 1], hess[ii * 3 + 1, jj * 3 + 2],
+                    hess[ii * 3 + 2, jj * 3 + 0], hess[ii * 3 + 2, jj * 3 + 1], hess[ii * 3 + 2, jj * 3 + 2]
+                )
+                triplets.vals[idx] = block
+                
+
+class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
     def __init__(self, h, meshes = [], transforms = [], static_meshes:StaticScene = None):
         self.meshes_filename = meshes 
         self.transforms = transforms
-        super().__init__(h)
+        RodBCBase.__init__(self, h)
+        self.soup.x_transformed = self.states.x
+        ContactSolverBase.__init__(self)
+    
+    def compute_A(self):
+        self.detect_collision()
+        
+        triplets = Triplets()
+        nnz = (self.n_contacts + self.n_contacts_pt) * 4 * 4
+        triplets.rows = wp.zeros((nnz,), dtype = int)
+        triplets.cols = wp.zeros_like(triplets.rows)
+        triplets.vals = wp.zeros((nnz,), dtype = mat33)
+        wp.launch(contact_hessian_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, triplets, self.b])
+        
+        wp.launch(contact_hessian_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, triplets, self.b, self.n_contacts])
+
+        collision_hess = bsr_from_triplets(self.n_nodes, self.n_nodes, triplets.rows, triplets.cols, triplets.vals)
+        
+        super().compute_A()
+        bsr_axpy(collision_hess, self.K_sparse, h * h, 1.0)
         
 def drape():
     # rod = RodBC(h, "assets/elephant.mesh")
