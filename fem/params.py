@@ -1,8 +1,9 @@
 import warp as wp
 import numpy as np 
+from scalar_types import *
 L, W = 1, 0.2
 # mu, rho, lam = 2e6, 1., 125.0
-mu, rho, lam = 2e6, 1.0e3, 2e7
+mu, rho, lam = scalar(2e6), scalar(1.0e3), scalar(2e7)
 g = 0.
 n_x = 20
 n_yz = 4
@@ -17,7 +18,7 @@ delta = 0.08
 volume = dx ** 3
 area = dx ** 3
 n_unknowns = n_nodes * 3
-gravity = wp.vec3(0, -g, 0)
+gravity = vec3(0, -g, 0)
 gravity_np = np.array([0.0, -g, 0])
 
 # damping
@@ -33,6 +34,6 @@ default_tobj = f"assets/{model}.tobj"
 class FEMMesh:
     n_nodes: int
     n_tets: int 
-    xcs: wp.array(dtype = wp.vec3)
+    xcs: wp.array(dtype = vec3)
     T: wp.array2d(dtype = int)
     indices: wp.array(dtype = int)

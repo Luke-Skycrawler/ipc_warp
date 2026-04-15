@@ -1,0 +1,510 @@
+import warp as wp 
+import numpy as np 
+from quat_util import vec3, vec4, mat33, mat44, scalar, Rq
+from geometry import Soup
+from BDF1 import BDFHistory
+
+_thickness = 0.01
+contact_volume = 10000
+# buffer = 0.01
+buffer = _thickness
+eps = 1e-6
+FLT_MAX = 1e5
+ZERO = 1e-6
+
+'''
+TODO: make sure max_unroll = 0 before importing this module
+
+(see `fix_interference` kernel)
+'''
+
+@wp.kernel 
+def edge_aabb(x: wp.array(dtype = vec3), edges: wp.array(dtype = int), aabb_lower: wp.array(dtype = wp.vec3), aabb_upper: wp.array(dtype = wp.vec3), thickness: scalar):
+    i = wp.tid()
+    p0 = x[edges[i * 2]]
+    p1 = x[edges[i * 2 + 1]]
+
+    aabb_lower[i] = wp.vec3(wp.min(p0, p1) - vec3(thickness))
+    aabb_upper[i] = wp.vec3(wp.max(p0, p1) + vec3(thickness))
+    
+@wp.kernel
+def c_gets_i_mod_2(color: wp.array(dtype = int)):
+    i = wp.tid() 
+    color[i] = i % 2
+
+@wp.kernel
+def _copy(dst: wp.array(dtype = wp.vec3), src: wp.array(dtype = vec3)):
+    i = wp.tid()
+    dst[i] = wp.vec3(src[i])
+
+# @wp.struct 
+# class ContactInfo:
+#     a1a2b1b2: wp.vec4i
+#     lam: scalar
+#     k: scalar
+#     cj: scalar
+
+@wp.struct 
+class XConstraint: 
+    a1a2b1b2: wp.vec4i
+    l0: scalar
+    alpha: scalar
+    lam: scalar
+
+ContactInfo = XConstraint
+# @wp.struct
+# class HTableEntry: 
+#     list_idx: int
+#     # updated_stamp: int
+
+@wp.struct 
+class Contacts:
+    list: wp.array(dtype = ContactInfo)
+    cnt: wp.array(dtype = int)
+    htable: wp.array(dtype = int)
+
+@wp.struct 
+class ContactRet:
+    points: wp.array(dtype = vec3)
+    dists: wp.array(dtype = scalar)
+
+@wp.func
+def fetch_b0b1(c: XConstraint, soup: Soup):
+    i0 = c.a1a2b1b2[0]
+    i2 = c.a1a2b1b2[2]
+    
+    b0 = soup.body[i0]
+    b1 = soup.body[i2]
+
+    return b0, b1
+
+@wp.func 
+def fetch_dist_n_r0r1(p0: BDFHistory, p1: BDFHistory, soup: Soup, c: XConstraint):
+    l0 = c.l0
+    i0 = c.a1a2b1b2[0]
+    i1 = c.a1a2b1b2[1]
+    i2 = c.a1a2b1b2[2]
+    i3 = c.a1a2b1b2[3]
+    
+    b0 = soup.body[i0]
+    b1 = soup.body[i2]
+
+    R0 = Rq(p0.nxt.q)
+    R1 = Rq(p1.nxt.q)
+    
+    c0 = p0.nxt.c
+    c1 = p1.nxt.c
+    
+    x0 = R0 @ soup.xcs[i0] + c0
+    x1 = R0 @ soup.xcs[i1] + c0
+    x2 = R1 @ soup.xcs[i2] + c1
+    x3 = R1 @ soup.xcs[i3] + c1
+
+    dab = wp.closest_point_edge_edge(wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3), eps)
+    v0 = wp.lerp(x0, x1, scalar(dab[0]))
+    v1 = wp.lerp(x2, x3, scalar(dab[1]))
+
+    v10 = v0 - v1
+    dist = scalar(dab[2])
+
+    n = v10 / dist
+    
+    r1 = v0 - c0 
+    r2 = v1 - c1
+
+    return dist, n, r1, r2
+
+@wp.func 
+def triangle_normal(x0: vec3, x1: vec3, x2: vec3):
+    return wp.normalize(wp.cross(x1 - x0, x2 - x0))
+
+@wp.func 
+def fetch_dist_n_r0r1_pt(p0: BDFHistory, p1: BDFHistory, soup: Soup, c: XConstraint):
+    '''
+    i, t0, t1, t2 
+    '''
+    o = scalar(1.0)
+    z = scalar(0.0)
+
+    l0 = c.l0
+    i = c.a1a2b1b2[0]
+    t0 = c.a1a2b1b2[1]
+    t1 = c.a1a2b1b2[2]
+    t2 = c.a1a2b1b2[3]
+    
+    R0 = Rq(p0.nxt.q)
+    R1 = Rq(p1.nxt.q)
+    
+    c0 = p0.nxt.c
+    c1 = p1.nxt.c
+    
+    x0 = R0 @ soup.xcs[i] + c0
+    x1 = R1 @ soup.xcs[t0] + c1
+    x2 = R1 @ soup.xcs[t1] + c1
+    x3 = R1 @ soup.xcs[t2] + c1
+
+    dab, type = closest_point_triangle(wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3))
+
+    v0 = x0
+    alpha = scalar(dab[0])
+    beta = scalar(dab[1])
+    v1 = alpha * x1 + beta * x2 + (scalar(1.0) - alpha - beta) * x3
+
+    v10 = v0 - v1
+    dist = scalar(dab[2])
+
+    n = vec3(v10 / dist)
+    
+    r1 = v0 - c0 
+    r2 = v1 - c1
+
+    # normal = triangle_normal(x1, x2, x3)
+    # if wp.dot(normal, v10) > scalar(0.0) and z < alpha < o and z < beta < o and alpha + beta < o:
+    # if wp.dot(normal, v10) > scalar(0.0) and type == 6:
+    #     n = -n
+    #     dist = -dist
+
+    return dist, n, r1, r2
+
+
+@wp.kernel
+def get_contact_points(p: wp.array(dtype = BDFHistory), soup: Soup, xconstraints: wp.array(dtype = XConstraint), contact_ret: ContactRet):
+    i = wp.tid()
+    c = xconstraints[i]
+    b0, b1 = fetch_b0b1(c, soup)
+    dist, n, r1, r2 = fetch_dist_n_r0r1(p[b0], p[b1], soup, c)
+    contact_ret.points[i] = (p[b0].nxt.c + r1 + p[b1].nxt.c + r2) * scalar(0.5)
+    contact_ret.dists[i] = dist
+
+@wp.kernel
+def get_contact_points_pt(p: wp.array(dtype = BDFHistory), soup: Soup, xconstraints: wp.array(dtype = XConstraint), contact_ret: ContactRet):
+    i = wp.tid()
+    c = xconstraints[i]
+    b0, b1 = fetch_b0b1(c, soup)
+    dist, n, r1, r2 = fetch_dist_n_r0r1_pt(p[b0], p[b1], soup, c)
+    contact_ret.points[i] = (p[b0].nxt.c + r1 + p[b1].nxt.c + r2) * scalar(0.5)
+    contact_ret.dists[i] = dist
+
+@wp.func
+def _hash(a1: int, b1: int) -> int:
+    '''
+    Hash function in "Optimized Spatial Hashing for Collision Detection of Deformable Objects"
+    '''
+    h = wp.bit_xor(a1 * 73856093, b1 * 19349663)
+    return h % 8191
+
+@wp.func
+def append(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness: float):
+    idx = wp.atomic_add(contacts.cnt, 0, 1)
+    h = _hash(a1, b1)
+    idx = idx % contact_volume
+    contacts.list[idx].a1a2b1b2 = wp.vec4i(a1, a2, b1, b2)
+    contacts.list[idx].l0 = scalar(thickness * 2.0)
+    contacts.list[idx].alpha = scalar(1e-6)
+    contacts.htable[h] = idx
+
+@wp.kernel
+def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thickness: float):
+    i = wp.tid()
+    if True:
+        # edge exists
+        a1 = soup.edges[i * 2]
+        a2 = soup.edges[i * 2 + 1]
+        p1 = wp.vec3(soup.x_transformed[a1])
+        p2 = wp.vec3(soup.x_transformed[a2])
+
+        low = wp.min(p1, p2) - wp.vec3(thickness + buffer)
+        high = wp.max(p1, p2) + wp.vec3(thickness + buffer)
+        query = wp.bvh_query_aabb(bvh, low, high)
+        j = int(0) 
+        while wp.bvh_query_next(query, j):
+            connected = soup.edges[i * 2] == soup.edges[j * 2] or soup.edges[i * 2] == soup.edges[j * 2 + 1] or soup.edges[i * 2 + 1] == soup.edges[j * 2] or soup.edges[i * 2 + 1] == soup.edges[j * 2 + 1]
+            
+            self_collision = soup.body[a1] == soup.body[soup.edges[j * 2]]
+            if i < j and not connected and not self_collision: 
+                b1 = soup.edges[j * 2]
+                b2 = soup.edges[j * 2 + 1]
+                
+                q1 = wp.vec3(soup.x_transformed[b1])
+                q2 = wp.vec3(soup.x_transformed[b2])
+                std = wp.closest_point_edge_edge(p1, p2, q1, q2, 1e-6)
+                dist = std[2]
+                if dist < (thickness + buffer) * 2.0:
+                    append(contacts, a1, a2, b1, b2, thickness)
+@wp.func
+def closest_point_triangle(
+    p: wp.vec3,
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+):
+    ret = wp.vec3(0.0)
+    type = int(-1)
+    ab = b - a
+    ac = c - a
+    ap = p - a
+
+    d1 = wp.dot(ab, ap)
+    d2 = wp.dot(ac, ap)
+    # Vertex region A
+    if d1 <= 0.0 and d2 <= 0.0:
+        ret = wp.vec3(1.0, 0.0, wp.length(p - a))
+        type = 0
+
+    bp = p - b
+    d3 = wp.dot(ab, bp)
+    d4 = wp.dot(ac, bp)
+
+    # Vertex region B
+    if d3 >= 0.0 and d4 <= d3 and type == -1:
+        ret = wp.vec3(0.0, 1.0, wp.length(p - b))
+        type = 1
+    # Edge region AB
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0 and type == -1:
+        v = d1 / (d1 - d3)
+        point = a + v * ab
+        ret = wp.vec3(1.0 - v, v, wp.length(p - point))
+        type = 3
+
+    cp = p - c
+    d5 = wp.dot(ab, cp)
+    d6 = wp.dot(ac, cp)
+
+    # Vertex region C
+    if d6 >= 0.0 and d5 <= d6 and type == -1:
+        ret = wp.vec3(0.0, 0.0, wp.length(p - c))
+        type = 2
+
+    # Edge region AC
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0 and type == -1:
+        w = d2 / (d2 - d6)
+        point = a + w * ac
+        ret = wp.vec3(1.0 - w, 0.0, wp.length(p - point))
+        type = 4
+
+    # Edge region BC
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0 and type == -1:
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        point = b + w * (c - b)
+        ret = wp.vec3(0.0, 1.0 - w, wp.length(p - point))
+        type = 5
+
+    if type == -1:
+        # Face region
+        denom = 1.0 / (va + vb + vc)
+        v = vb * denom
+        w = vc * denom
+        u = 1.0 - v - w
+
+        point = a + ab * v + ac * w
+        ret = wp.vec3(u, v, wp.length(p - point))
+        type = 6
+
+    return ret, type
+        
+@wp.kernel
+def point_triangle_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thickness: float):
+    i = wp.tid()
+    if True:
+        # point not inverted 
+        xi = wp.vec3(soup.x_transformed[i])
+        low = xi - wp.vec3((thickness + buffer) * 2.0)
+        high = xi + wp.vec3((thickness + buffer) * 2.0)
+        query = wp.mesh_query_aabb(bvh, low, high)
+
+        j = int(0) 
+        while wp.mesh_query_aabb_next(query, j):
+            connected = soup.triangles[j * 3] == i or soup.triangles[j * 3 + 1] == i or soup.triangles[j * 3 + 2] == i
+
+            self_collision = soup.body[i] == soup.body[soup.triangles[j * 3]]
+            if not connected and not self_collision: 
+                t1 = soup.triangles[j * 3]
+                t2 = soup.triangles[j * 3 + 1]
+                t3 = soup.triangles[j * 3 + 2]
+
+                q1 = wp.vec3(soup.x_transformed[t1])
+                q2 = wp.vec3(soup.x_transformed[t2])
+                q3 = wp.vec3(soup.x_transformed[t3])
+
+                std, _ = closest_point_triangle(xi, q1, q2, q3)
+
+                dist = std[2]
+                if dist < (thickness + buffer) * 2.0:
+                    append(contacts, i, t2, t1, t3, thickness)
+
+@wp.func 
+def fix_interference(v: wp.vec4i, color: wp.array(dtype = int), dirty: wp.array(dtype = bool)):
+    colors = wp.vec4i(color[v.x], color[v.y], color[v.z], color[v.w])
+    cm = wp.max(colors)
+
+    for ii in range(1, 4):
+        for jj in range(ii):
+            if color[v[jj]] == color[v[ii]]:
+                color[v[ii]] = cm + 1
+                cm += 1
+                dirty[v[ii]] = True
+
+@wp.kernel
+def color_contacts(contacts: Contacts, color: wp.array(dtype = int), dirty: wp.array(dtype = bool)):
+    i = wp.tid() 
+    if i < contacts.cnt[0]:
+        fix_interference(contacts.list[i].a1a2b1b2, color, dirty)
+
+@wp.kernel
+def compute_normal_kernel(x: wp.array(dtype = vec3), triangles: wp.array(dtype = int), N: wp.array(dtype = vec3)):
+    i = wp.tid()
+    t1 = triangles[i * 3]
+    t2 = triangles[i * 3 + 1]
+    t3 = triangles[i * 3 + 2]
+
+    x1 = x[t1]
+    x2 = x[t2]
+    x3 = x[t3]
+
+    N[i] = triangle_normal(x1, x2, x3)
+
+class ContactSolverBase:
+    def __init__(self):
+        '''
+        Base contact interface to detect the edge-edge contacts. Contains an optional colorization function
+
+        need to have self.soup: Soup defined prior to calling this constructor
+        '''
+        self.soup: Soup
+
+        n_edges = self.soup.edges.shape[0] // 2
+        n_nodes = self.soup.xcs.shape[0]
+        
+        # edges bvh
+        self.bvh_edges_lower = wp.zeros((n_edges, ), dtype = wp.vec3) 
+        self.bvh_edges_upper = wp.zeros((n_edges, ), dtype = wp.vec3)
+        self.compute_edge_aabbs()
+        self.bvh_edges = wp.Bvh(self.bvh_edges_lower, self.bvh_edges_upper)
+        
+        # triangles 
+        self.has_triangles = self.soup.triangles.shape[0] > 0
+        if self.has_triangles:
+            self.x_mesh = wp.zeros((self.soup.x_transformed.shape[0], ), dtype = wp.vec3)
+            # must be wp.vec3 type to construct the mesh bvh 
+            # sync with self.soup.x_transformed in compute_V()
+            self.tri_mesh = wp.Mesh(self.x_mesh, self.soup.triangles)
+        
+
+        # color 
+        self.color = wp.zeros((n_nodes, ), dtype = int)
+        # self.color_cnt = wp.zeros((1,), dtype = int)
+        self.dirty_bit = wp.zeros((n_nodes, ), dtype = bool)
+
+
+
+        self.contacts_list_new = wp.zeros((contact_volume,), dtype = ContactInfo)
+        self.contacts_cnt_new = wp.zeros((1,), dtype = int)
+        self.contacts_htable_new = wp.zeros((8191,), dtype = int)
+        self.contacts_new = Contacts()
+
+        self.contacts_new.list = self.contacts_list_new
+        self.contacts_new.cnt = self.contacts_cnt_new
+        self.contacts_new.htable = self.contacts_htable_new
+
+        self.n_contacts = 0
+        self.n_contacts_pt = 0
+
+        self.contact_ret = ContactRet()
+        self.contact_ret.points = wp.zeros((contact_volume,), dtype = vec3)
+        self.contact_ret.dists = wp.zeros((contact_volume,), dtype = scalar)
+
+
+        self.contacts_list_pt = wp.zeros((contact_volume, ), dtype = ContactInfo)
+        self.contacts_cnt_pt = wp.zeros((1,), dtype = int)
+        self.contacts_htable_pt = wp.zeros((8191,), dtype = int)
+        self.contacts_pt = Contacts()
+
+        self.contacts_pt.list = self.contacts_list_pt
+        self.contacts_pt.cnt = self.contacts_cnt_pt
+        self.contacts_pt.htable = self.contacts_htable_pt
+
+        self.n_contacts_pt = 0
+
+    def update_bvh(self):
+        self.compute_edge_aabbs()
+        self.bvh_edges.refit()
+        if self.has_triangles:
+            wp.launch(_copy, dim = self.soup.x_transformed.shape[0], inputs = [self.x_mesh, self.soup.x_transformed])
+            self.tri_mesh.refit()
+    
+    def compute_edge_aabbs(self):
+        n_edges = self.soup.edges.shape[0] // 2
+        wp.launch(edge_aabb, n_edges, inputs = [self.soup.x_transformed, self.soup.edges, self.bvh_edges_lower, self.bvh_edges_upper, _thickness + buffer])
+
+    def colorization(self):
+        n_nodes = self.soup.xcs.shape[0]
+        wp.launch(c_gets_i_mod_2, n_nodes, inputs = [self.color])
+        dirty = True 
+        while (dirty):
+            self.dirty_bit.zero_()
+            wp.launch(color_contacts, (self.n_contacts, ), inputs = [self.contacts, self.color, self.dirty_bit])
+            dirty = self.dirty_bit.numpy().any()
+            # if dirty:
+            #     print("dirty! recoloring...")
+        self.color_cnt = np.max(self.color.numpy()) + 1
+        # print(f"color cnt = {self.color_cnt}")
+        # colornp = self.color.numpy()
+        # print(f"color in contact pairs (19, 20, 21, 59, 60, 61): {colornp[19]}, {colornp[20]}, {colornp[21]}, {colornp[59]}, {colornp[60]}, {colornp[61]}")
+    
+    def compute_V(self, ret = True): 
+        return None
+        
+    def detect_collision(self): 
+        self.compute_V(ret = False)
+        self.update_bvh()
+        self.contacts_new.cnt.zero_()
+        self.contacts_new.htable.fill_(-1)
+        n_edges = self.soup.edges.shape[0] // 2
+        
+        wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness])
+        self.n_contacts = self.contacts_new.cnt.numpy()[0]
+        print(f"n ee contacts = {self.n_contacts}")
+        # print(self.contacts.list.numpy()["a1a2b1b2"][:self.n_contacts])
+
+        self.contacts_pt.cnt.zero_()
+        self.contacts_pt.htable.fill_(-1)
+        n_pts = self.soup.xcs.shape[0]
+        if self.has_triangles:
+            wp.launch(point_triangle_collision, n_pts, inputs = [self.tri_mesh.id, self.soup, self.contacts_pt, _thickness])
+
+
+            self.n_contacts_pt = self.contacts_pt.cnt.numpy()[0]
+            print(f"n pt contacts = {self.n_contacts_pt}")
+
+    def compute_N(self):
+        N = wp.zeros((self.soup.triangles.shape[0] // 3, ), dtype = vec3)
+        wp.launch(compute_normal_kernel, (self.F.shape[0], ), inputs = [self.soup.x_transformed, self.soup.triangles, N])
+        return N.numpy()
+
+    def get_contact_points(self):
+        wp.launch(get_contact_points, (self.n_contacts,), inputs = [self.history, self.soup, self.contacts_new.list, self.contact_ret])
+        # filter d > 2 * thickness
+        dists = self.contact_ret.dists.numpy()[:self.n_contacts]
+        points = self.contact_ret.points.numpy()[:self.n_contacts]
+        
+        valid = dists < _thickness * 2.0
+        magnitudes = np.abs(dists[valid] - _thickness * 2.0)
+
+        points_valid = points[valid]
+        if self.has_triangles:
+            wp.launch(get_contact_points_pt, (self.n_contacts_pt,), inputs = [self.history, self.soup, self.contacts_pt.list, self.contact_ret])
+            
+            dists_pt = self.contact_ret.dists.numpy()[:self.n_contacts_pt]
+
+            points_pt = self.contact_ret.points.numpy()[:self.n_contacts_pt]
+            valid_pt = dists_pt < _thickness * 2.0
+            magnitudes_pt = np.abs(dists_pt[valid_pt] - _thickness * 2.0)
+            # print(f"dists pt = {dists_pt}")
+            return points_pt[valid_pt], magnitudes_pt
+            
+            # points_valid = np.vstack([points_valid, points_pt[valid_pt]])
+            # magnitudes = np.concatenate([magnitudes, magnitudes_pt])
+        return points_valid, magnitudes

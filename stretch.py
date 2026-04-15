@@ -11,6 +11,7 @@ from fem.fem import tet_kernel, tet_kernel_sparse, Triplets, psi
 from warp.optim.linear import bicgstab, cg
 from geometry.static_scene import StaticScene
 from warp.fem.linalg import array_axpy
+from scalar_types import *
 eps = 3e-4
 h = 1e-2
 rho = 1e3
@@ -19,28 +20,28 @@ boundary_v = 0.0
 
 quasi_static = False
 twist = True
-attachment_stiffness = 1e8
+attachment_stiffness = scalar(1e8)
 
 @wp.struct 
 class NewtonState: 
-    x: wp.array(dtype = wp.vec3)
-    x0: wp.array(dtype = wp.vec3)
-    dx: wp.array(dtype = wp.vec3)
-    xdot: wp.array(dtype = wp.vec3)
-    M: wp.array(dtype = float)
-    Psi: wp.array(dtype = float)
+    x: wp.array(dtype = vec3)
+    x0: wp.array(dtype = vec3)
+    dx: wp.array(dtype = vec3)
+    xdot: wp.array(dtype = vec3)
+    M: wp.array(dtype = scalar)
+    Psi: wp.array(dtype = scalar)
 
 @wp.kernel
-def set_M_diag(d: wp.array(dtype = float), M: wp.array(dtype = wp.mat33)):  
+def set_M_diag(d: wp.array(dtype = scalar), M: wp.array(dtype = mat33)):  
     i =  wp.tid()
-    mii = wp.identity(3, dtype = float)
+    mii = wp.identity(3, dtype = scalar)
     mii *= d[i]
     M[i] = mii
 
 
 @wp.func
-def x_minus_tilde(state: NewtonState, h: float, i: int) -> wp.vec3:
-    ret = wp.vec3(0.0)
+def x_minus_tilde(state: NewtonState, h: scalar, i: int) -> vec3:
+    ret = vec3()
     if quasi_static:
         ret = gravity
     else: 
@@ -48,7 +49,7 @@ def x_minus_tilde(state: NewtonState, h: float, i: int) -> wp.vec3:
     return ret
 
 @wp.kernel
-def compute_rhs(state: NewtonState, h: float, M: wp.array(dtype = float), b: wp.array(dtype = wp.vec3)):
+def compute_rhs(state: NewtonState, h: scalar, M: wp.array(dtype = scalar), b: wp.array(dtype = vec3)):
     '''
     before execution, b[i] stores the elastic forces 
     turns rhs into df/dx, where f is the argmin function Vh^2 + 0.5 M(x - x+tilde) ^ 2 
@@ -61,7 +62,7 @@ def compute_rhs(state: NewtonState, h: float, M: wp.array(dtype = float), b: wp.
 
 
 @wp.func
-def should_fix(x: wp.vec3): 
+def should_fix(x: vec3): 
     ret = False
     if wp.static(twist): 
         ret = x[0] < -0.5 + eps or x[0] > 0.5 - eps
@@ -69,19 +70,19 @@ def should_fix(x: wp.vec3):
         ret = x[0] < -0.5 + eps 
     return ret
 
-    # v0 = wp.vec3(-56.273449910216, 94.689259419722, -19.03583034376)
+    # v0 = vec3(-56.273449910216, 94.689259419722, -19.03583034376)
     # return wp.length_sq(x - v0) < eps
 @wp.func
-def moving_boundary(x: wp.vec3):
+def moving_boundary(x: vec3):
     return x[0] < -0.5 + eps# or x[0] > 0.5 - eps
     
 
 @wp.kernel
-def set_b_fixed(geo: FEMMesh,b: wp.array(dtype = wp.vec3)):
+def set_b_fixed(geo: FEMMesh,b: wp.array(dtype = vec3)):
     i = wp.tid()
     # set fixed points rhs to 0
     if should_fix(geo.xcs[i]): 
-        b[i] = wp.vec3(0.0, 0.0, 0.0)
+        b[i] = vec3()
 
 @wp.kernel
 def set_K_fixed(geo: FEMMesh, triplets: Triplets):
@@ -95,23 +96,23 @@ def set_K_fixed(geo: FEMMesh, triplets: Triplets):
     
     if should_fix(geo.xcs[i]) or should_fix(geo.xcs[j]):        
         if ii == jj:
-            triplets.vals[eij] += wp.identity(3, dtype = float) * attachment_stiffness
+            triplets.vals[eij] += wp.identity(3, dtype = scalar) * attachment_stiffness
         # else:
-        #     triplets.vals[eij] = wp.mat33(0.0)
+        #     triplets.vals[eij] = mat33(0.0)
 
 @wp.kernel
-def add_dx(state: NewtonState, alpha :float):
+def add_dx(state: NewtonState, alpha :scalar):
     i = wp.tid()
     state.x[i] -= state.dx[i] * alpha
 
 @wp.kernel
-def update_x0_xdot(state: NewtonState, h: float):
+def update_x0_xdot(state: NewtonState, h: scalar):
     i = wp.tid()
     state.xdot[i] = (state.x[i] - state.x0[i]) / h
     state.x0[i] = state.x[i]
 
 @wp.kernel
-def compute_Psi(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype = float), Psi: wp.array(dtype = float)):
+def compute_Psi(x: wp.array(dtype = vec3), geo: FEMMesh, Bm: wp.array(dtype = mat33), W: wp.array(dtype = scalar), Psi: wp.array(dtype = scalar)):
     e = wp.tid()
     t0 = x[geo.T[e, 0]]
     t1 = x[geo.T[e, 1]]
@@ -126,39 +127,40 @@ def compute_Psi(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(dtype =
     Psi[e] = W[e] * psie
 
 @wp.kernel
-def compute_inertia(geo: FEMMesh, state: NewtonState, M: wp.array(dtype = float), inert: wp.array(dtype = float), comp_x: wp.array(dtype = wp.vec3), h: float):
+def compute_inertia(geo: FEMMesh, state: NewtonState, M: wp.array(dtype = scalar), inert: wp.array(dtype = scalar), comp_x: wp.array(dtype = vec3), h: scalar):
     i = wp.tid()
 
     # if not should_fix(geo.xcs[i]):
     if True:
         dx = x_minus_tilde(state, h, i)
-        de = wp.length_sq(dx) * M[i] * 0.5 + wp.dot(comp_x[i], state.x[i])
+        de = wp.length_sq(dx) * M[i] * scalar(0.5) + wp.dot(comp_x[i], state.x[i])
         # de = wp.dot(comp_x[i], state.x[i])
         wp.atomic_add(inert, 0, de)
 
 @wp.kernel
-def compute_compensation(state: NewtonState, geo: FEMMesh, theta: float, comp_x: wp.array(dtype = wp.vec3)):
+def compute_compensation(state: NewtonState, geo: FEMMesh, theta: scalar, comp_x: wp.array(dtype = vec3)):
     i = wp.tid()
+    z = scalar(0.0)
     xi = state.x[i]
-    c = wp.cos(theta * omega)
-    s = wp.sin(theta * omega)
-    rot = wp.mat22(
+    c = wp.cos(theta * scalar(omega))
+    s = wp.sin(theta * scalar(omega))
+    rot = mat22(
         c, s,
         -s, c
     )
     x_rst= geo.xcs[i]
     if moving_boundary(x_rst):
     # if False:
-        yz_rst = wp.vec2(x_rst[1], x_rst[2])
+        yz_rst = vec2(x_rst[1], x_rst[2])
         yz = rot @ yz_rst
         if x_rst[0] < 0.0:
             yz = wp.transpose(rot) @ yz_rst
-        target = wp.vec3(x_rst[0], yz[0], yz[1]) # + wp.vec3(0.0, theta, 0.0)
-        # target = x_rst + wp.vec3(0.0, theta, 0.0)
-        target += wp.vec3(boundary_v * theta, 0.0, 0.0)
+        target = vec3(x_rst[0], yz[0], yz[1]) # + vec3(z, theta, z)
+        # target = x_rst + vec3(z, theta, z)
+        target += vec3(scalar(boundary_v) * theta, z, z)
         comp_x[i] = xi - target
     else:
-        comp_x[i] = wp.vec3(0.0)
+        comp_x[i] = vec3(z)
 
 class PSViewer:
     def __init__(self, rod, static_mesh: StaticScene = None):
@@ -232,7 +234,7 @@ class RodBCBase:
         self.states.x0 = wp.zeros_like(self.xcs)
         self.states.dx = wp.zeros_like(self.xcs)
         self.states.xdot = wp.zeros_like(self.xcs)
-        self.states.Psi = wp.zeros((self.n_tets,), dtype = float)
+        self.states.Psi = wp.zeros((self.n_tets,), dtype = scalar)
 
         self.comp_x = wp.zeros_like(self.states.dx)
         
@@ -254,12 +256,12 @@ class RodBCBase:
         T = self.T.numpy()
         # self.M is a vector composed of diagonal elements 
         self.Mnp = igl.massmatrix(V, T, igl.MASSMATRIX_TYPE_BARYCENTRIC).diagonal()
-        self.M = wp.zeros((self.n_nodes,), dtype = float)
+        self.M = wp.zeros((self.n_nodes,), dtype = scalar)
         self.M.assign(self.Mnp * rho)
         self.M.fill_(1.0)
 
-        self.M_sparse = bsr_zeros(self.n_nodes, self.n_nodes, wp.mat33)
-        M_diag = wp.zeros((self.n_nodes,), dtype = wp.mat33)
+        self.M_sparse = bsr_zeros(self.n_nodes, self.n_nodes, mat33)
+        M_diag = wp.zeros((self.n_nodes,), dtype = mat33)
         wp.launch(set_M_diag, (self.n_nodes,), inputs = [self.M, M_diag])
         bsr_set_diag(self.M_sparse, M_diag)
 
@@ -379,7 +381,7 @@ class RodBCBase:
         return np.sum(self.states.Psi.numpy()) * h * h
     
     def compute_inertia(self):
-        inert = wp.zeros((1,), dtype = float)
+        inert = wp.zeros((1,), dtype = scalar)
         wp.launch(compute_inertia, (self.n_nodes, ), inputs = [self.geo, self.states, self.M, inert, self.comp_x, self.h])
         return inert.numpy()[0]
 

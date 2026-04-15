@@ -8,7 +8,7 @@ import igl
 from .params import *
 from warp.sparse import bsr_axpy, bsr_set_from_triplets, bsr_zeros, BsrMatrix
 from scipy.sparse import bsr_matrix
-
+from scalar_types import *
 from .neo_hookean import PK1, tangent_stiffness, psi
 # from .linear_elasticity import PK1, tangent_stiffness, psi
 # from .stvk import PK1, tangent_stiffness, psi
@@ -16,10 +16,10 @@ from .neo_hookean import PK1, tangent_stiffness, psi
 class Triplets:
     rows: wp.array(dtype = int)
     cols: wp.array(dtype = int)
-    vals: wp.array(dtype = wp.mat33)
+    vals: wp.array(dtype = mat33)
 
 @wp.kernel
-def compute_Dm(geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype = float)): 
+def compute_Dm(geo: FEMMesh, Bm: wp.array(dtype = mat33), W: wp.array(dtype = scalar)): 
     e = wp.tid()
 
     x0 = geo.xcs[geo.T[e, 0]]
@@ -27,17 +27,17 @@ def compute_Dm(geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype =
     x2 = geo.xcs[geo.T[e, 2]]
     x3 = geo.xcs[geo.T[e, 3]]
 
-    # Dm = wp.mat33(x0 - x3, x1 - x3, x2 - x3)    
+    # Dm = mat33(x0 - x3, x1 - x3, x2 - x3)    
     Dm = wp.matrix_from_cols(x0 - x3, x1 - x3, x2 - x3)
     inv_Dm = wp.inverse(Dm)
     Bm[e] = inv_Dm
-    W[e] = wp.abs(wp.determinant(Dm)) / 6.0
+    W[e] = wp.abs(wp.determinant(Dm)) / scalar(6.0)
 
     
 
 # still works, deprecated due to high compile time
 # @wp.kernel
-# def tet_kernel1(geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype = float), a: wp.array2d(dtype = float)):
+# def tet_kernel1(geo: FEMMesh, Bm: wp.array(dtype = mat33), W: wp.array(dtype = scalar), a: wp.array2d(dtype = scalar)):
 
 #     e = wp.tid()
 #     for _j in range(4):
@@ -46,18 +46,18 @@ def compute_Dm(geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype =
 #         t2 = geo.xcs[geo.T[e, 2]]
 #         t3 = geo.xcs[geo.T[e, 3]]
         
-#         Ds = wp.mat33(t0 - t3, t1 - t3, t2 - t3)
+#         Ds = mat33(t0 - t3, t1 - t3, t2 - t3)
         
 #         F = Ds @ Bm[e]
 #         for k in range(3):
             
-#             dDs = wp.mat33(0.0)
+#             dDs = mat33(z)
 #             if _j < 3: 
-#                 dDs[k, _j] = -1.0
+#                 dDs[k, _j] = -o
 #             else: 
-#                 dDs[k, 0] = 1.0
-#                 dDs[k, 1] = 1.0
-#                 dDs[k, 2] = 1.0
+#                 dDs[k, 0] = o
+#                 dDs[k, 1] = o
+#                 dDs[k, 2] = o
 #             dF = dDs @ Bm[e]
 #             dP = tangent_stiffness(F, dF)
 #             dH = -W[e] * dP @ wp.transpose(Bm[e])
@@ -65,20 +65,21 @@ def compute_Dm(geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype =
 #             for _i in range(4):
 #                 i = geo.T[e, _i]
 #                 j = geo.T[e, _j]
-#                 df = wp.vec3(0.0)
+#                 df = vec3(z)
 #                 if _i == 3: 
-#                     df= -wp.vec3(dH[0, 0] + dH[0, 1] + dH[0, 2], dH[1, 0] + dH[1, 1] + dH[1, 2], dH[2, 0] + dH[2, 1] + dH[2, 2])
+#                     df= -vec3(dH[0, 0] + dH[0, 1] + dH[0, 2], dH[1, 0] + dH[1, 1] + dH[1, 2], dH[2, 0] + dH[2, 1] + dH[2, 2])
 
 #                 else:
-#                     df = wp.vec3(dH[0, _i], dH[1, _i], dH[2, _i])
+#                     df = vec3(dH[0, _i], dH[1, _i], dH[2, _i])
                 
 #                 for l in range(3):
 #                     a[i * 3 + l, j * 3 + k] += df[l]
 
     
 @wp.kernel
-def tet_kernel(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype = float), a: wp.array2d(dtype = float), b: wp.array(dtype = wp.vec3)):
-
+def tet_kernel(x: wp.array(dtype = vec3), geo: FEMMesh, Bm: wp.array(dtype = mat33), W: wp.array(dtype = scalar), a: wp.array2d(dtype = scalar), b: wp.array(dtype = vec3)):
+    o = scalar(1.0)
+    z = scalar(0.0)
     ej = wp.tid()
     e = ej // 16
     _j = ej % 4
@@ -104,28 +105,28 @@ def tet_kernel(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(dtype = 
 
     for k in range(3):
         
-        dDs = wp.mat33(0.0)
+        dDs = mat33()
         if _j < 3: 
-            dDs[k, _j] = -1.0
+            dDs[k, _j] = -o
         else: 
-            dDs[k, 0] = 1.0
-            dDs[k, 1] = 1.0
-            dDs[k, 2] = 1.0
+            dDs[k, 0] = o
+            dDs[k, 1] = o
+            dDs[k, 2] = o
 
         dF = dDs @ Bm[e]
         dP = tangent_stiffness(F, dF)
         dH = -W[e] * dP @ wp.transpose(Bm[e])
-        df = wp.vec3(0.0)
+        df = vec3(z)
         if _i == 3: 
-            df= -wp.vec3(dH[0, 0] + dH[0, 1] + dH[0, 2], dH[1, 0] + dH[1, 1] + dH[1, 2], dH[2, 0] + dH[2, 1] + dH[2, 2])
+            df= -vec3(dH[0, 0] + dH[0, 1] + dH[0, 2], dH[1, 0] + dH[1, 1] + dH[1, 2], dH[2, 0] + dH[2, 1] + dH[2, 2])
 
         else:
-            df = wp.vec3(dH[0, _i], dH[1, _i], dH[2, _i])
+            df = vec3(dH[0, _i], dH[1, _i], dH[2, _i])
         
         for l in range(3):
             a[i * 3 + l, j * 3 + k] += df[l]
 
-    df = wp.vec3(0.0)
+    df = vec3(z)
     if _i == 3: 
         df = -H[0] - H[1] - H[2]
     else: 
@@ -135,8 +136,9 @@ def tet_kernel(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(dtype = 
         wp.atomic_add(b, i, df)
 
 @wp.kernel
-def tet_kernel_sparse(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype = float), triplets: Triplets, b: wp.array(dtype = wp.vec3)):
-
+def tet_kernel_sparse(x: wp.array(dtype = vec3), geo: FEMMesh, Bm: wp.array(dtype = mat33), W: wp.array(dtype = scalar), triplets: Triplets, b: wp.array(dtype = vec3)):
+    z = scalar(0.0)
+    o = scalar(1.0)
     ej = wp.tid()
     e = ej // 16
     _j = ej % 4
@@ -150,7 +152,7 @@ def tet_kernel_sparse(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(d
     
     F = Ds @ Bm[e]
     
-    a = wp.mat33(0.0)
+    a = mat33()
 
     i = geo.T[e, _i]
 
@@ -164,23 +166,23 @@ def tet_kernel_sparse(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(d
     j = geo.T[e, _j]
     for k in range(3):
         
-        dDs = wp.mat33(0.0)
+        dDs = mat33(z)
         if _j < 3: 
-            dDs[k, _j] = -1.0
+            dDs[k, _j] = -o
         else: 
-            dDs[k, 0] = 1.0
-            dDs[k, 1] = 1.0
-            dDs[k, 2] = 1.0
+            dDs[k, 0] = o
+            dDs[k, 1] = o
+            dDs[k, 2] = o
         dF = dDs @ Bm[e]
         dP = tangent_stiffness(F, dF)
         dH = -W[e] * dP @ wp.transpose(Bm[e])
 
-        df = wp.vec3(0.0)
+        df = vec3(z)
         if _i == 3: 
-            df= -wp.vec3(dH[0, 0] + dH[0, 1] + dH[0, 2], dH[1, 0] + dH[1, 1] + dH[1, 2], dH[2, 0] + dH[2, 1] + dH[2, 2])
+            df= -vec3(dH[0, 0] + dH[0, 1] + dH[0, 2], dH[1, 0] + dH[1, 1] + dH[1, 2], dH[2, 0] + dH[2, 1] + dH[2, 2])
 
         else:
-            df = wp.vec3(dH[0, _i], dH[1, _i], dH[2, _i])
+            df = vec3(dH[0, _i], dH[1, _i], dH[2, _i])
         
         for l in range(3):
             a[l, k] += df[l]
@@ -191,7 +193,7 @@ def tet_kernel_sparse(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(d
     triplets.cols[cnt] = j
     triplets.vals[cnt] = a
 
-    fi = wp.vec3(0.0)
+    fi = vec3(z)
     if _i == 3: 
         fi = -H[0] - H[1] - H[2]
     else:
@@ -207,9 +209,9 @@ class SifakisFEM:
     def __init__(self):
         super().__init__()
         n_unknowns = 3 * self.n_nodes
-        self.b = wp.zeros((self.n_nodes, ), dtype = wp.vec3)
-        self.Bm = wp.zeros((self.n_tets), dtype = wp.mat33)
-        self.W = wp.zeros((self.n_tets), dtype = wp.float32)
+        self.b = wp.zeros((self.n_nodes, ), dtype = vec3)
+        self.Bm = wp.zeros((self.n_tets), dtype = mat33)
+        self.W = wp.zeros((self.n_tets), dtype = scalar)
         self.geo = FEMMesh()
         self.geo.n_nodes = self.n_nodes
         self.geo.n_tets = self.n_tets
@@ -237,14 +239,14 @@ class SifakisFEM:
         self.triplets = Triplets()
         self.triplets.rows = wp.zeros((self.n_tets * 4 * 4), dtype = int)
         self.triplets.cols = wp.zeros_like(self.triplets.rows)
-        self.triplets.vals = wp.zeros((self.n_tets * 4 * 4), dtype = wp.mat33)
+        self.triplets.vals = wp.zeros((self.n_tets * 4 * 4), dtype = mat33)
 
         wp.launch(tet_kernel_sparse, (self.n_tets * 4 * 4,), inputs = [self.xcs, self.geo, self.Bm, self.W, self.triplets, self.b]) 
 
     def define_K_sparse(self):
         self.compute_Dm()
         self.tet_kernel_sparse()
-        self.K_sparse = bsr_zeros(self.n_nodes, self.n_nodes, wp.mat33)
+        self.K_sparse = bsr_zeros(self.n_nodes, self.n_nodes, mat33)
         
         bsr_set_from_triplets(self.K_sparse, self.triplets.rows, self.triplets.cols, self.triplets.vals)
         

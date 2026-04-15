@@ -7,6 +7,7 @@ from stretch import PSViewer, RodBCBase
 from .params import *
 import polyscope as ps 
 import igl 
+from scalar_types import *
 h = 1e-2
 default_shell = "assets/shell/shell.obj"
 ksu = 1e7
@@ -30,7 +31,7 @@ class EdgeTopoloby:
 
 
 @wp.func 
-def cot(c: float): 
+def cot(c: scalar): 
     '''
     c: cosine of angle 
     '''
@@ -38,7 +39,7 @@ def cot(c: float):
     return c / s
 
 @wp.func 
-def cij(ei: wp.vec3, ej: wp.vec3): 
+def cij(ei: vec3, ej: vec3): 
     '''
     cotangent of ei, ej sharing an vertex
     ei, ej points out from the shared vertex 
@@ -49,7 +50,7 @@ def cij(ei: wp.vec3, ej: wp.vec3):
     return cot(c) 
     
 @wp.kernel
-def quadratic_bending(geo: FEMMesh, topo: EdgeTopoloby, triplets: Triplets, W: wp.array(dtype = float)):
+def quadratic_bending(geo: FEMMesh, topo: EdgeTopoloby, triplets: Triplets, W: wp.array(dtype = scalar)):
     '''
     bending energy for edge eij = (vi, vj) shared by two triangles (vi, vj, vk) and (vj, vi, vl)
     E_bend = 1/2 x^T Q x
@@ -87,7 +88,7 @@ def quadratic_bending(geo: FEMMesh, topo: EdgeTopoloby, triplets: Triplets, W: w
         c02 = cij(x1 - x0, x3 - x0)
         
         K0 = wp.vec4(c03 + c04, c01 + c02, -c01 - c03, -c02 - c04)
-        i33 = wp.identity(3, dtype = float)
+        i33 = wp.identity(3, dtype = scalar)
         idx = wp.vec4i(ii, jj, kk, ll)
         a0 = wp.abs(W[t0])
         a1 = wp.abs(W[t1])
@@ -103,7 +104,7 @@ def quadratic_bending(geo: FEMMesh, topo: EdgeTopoloby, triplets: Triplets, W: w
     
 
 @wp.kernel
-def shell_kernel_sparse(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype = float), triplets: Triplets, b: wp.array(dtype = wp.vec3)):
+def shell_kernel_sparse(x: wp.array(dtype = vec3), geo: FEMMesh, Bm: wp.array(dtype = mat33), W: wp.array(dtype = scalar), triplets: Triplets, b: wp.array(dtype = vec3)):
     '''
     E_stretch = 1/2 (ksu Cu^2 + ksv Cv^2) * area
     Cu, Cv = |wu| - 1, |wv| - 1
@@ -148,8 +149,8 @@ def shell_kernel_sparse(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array
     
     uuT = wp.outer(wu_unit, wu_unit)
     vvT = wp.outer(wv_unit, wv_unit)
-    shear_common_u = (wp.identity(3, float) - uuT) @ wv_unit / (Cu + 1.0)
-    shear_common_v = (wp.identity(3, float) - vvT) @ wu_unit / (Cv + 1.0)
+    shear_common_u = (wp.identity(3, scalar) - uuT) @ wv_unit / (Cu + 1.0)
+    shear_common_v = (wp.identity(3, scalar) - vvT) @ wu_unit / (Cv + 1.0)
 
     fi = -ae * (ksu * dwudpi * wu_unit * Cu  + ksv * dwvdpi * wv_unit * Cv + C_shear * shear_common_u * dwudpi + C_shear * shear_common_v * dwvdpi)
 
@@ -168,14 +169,14 @@ def shell_kernel_sparse(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array
     ajj = ae * (ksu * dwudpj * dwudpj * uuT + ksv * dwvdpj * dwvdpj * vvT)
 
     if Cu >= 0.0: 
-        commonu = Cu / (Cu + 1.0) * ksu * ae * (wp.identity(3, float) - uuT) 
+        commonu = Cu / (Cu + 1.0) * ksu * ae * (wp.identity(3, scalar) - uuT) 
 
         aii += commonu * dwudpi * dwudpi
         aij += commonu * dwudpi * dwudpj
         ajj += commonu * dwudpj * dwudpj
 
     if Cv >= 0.0:
-        commonv = Cv / (Cv + 1.0) * ksv * ae * (wp.identity(3, float) - vvT) 
+        commonv = Cv / (Cv + 1.0) * ksv * ae * (wp.identity(3, scalar) - vvT) 
 
         aii += commonv * dwvdpi * dwvdpi
         aij += commonv * dwvdpi * dwvdpj
@@ -206,7 +207,7 @@ def shell_kernel_sparse(x: wp.array(dtype = wp.vec3), geo: FEMMesh, Bm: wp.array
     triplets.vals[cnt + 8] = akk
 
 @wp.kernel
-def compute_Dm(geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype = float)): 
+def compute_Dm(geo: FEMMesh, Bm: wp.array(dtype = mat33), W: wp.array(dtype = scalar)): 
     e = wp.tid()
 
     x0 = geo.xcs[geo.T[e, 0]]
@@ -227,9 +228,9 @@ def compute_Dm(geo: FEMMesh, Bm: wp.array(dtype = wp.mat33), W: wp.array(dtype =
 
     inv_Dm = wp.inverse(Dm)
     Bm[e] = wp.matrix_from_rows(
-        wp.vec3(inv_Dm[0, 0], inv_Dm[0, 1], 0.0),
-        wp.vec3(inv_Dm[1, 0], inv_Dm[1, 1], 0.0),
-        wp.vec3(0.0, 0.0, 1.)
+        vec3(inv_Dm[0, 0], inv_Dm[0, 1], 0.0),
+        vec3(inv_Dm[1, 0], inv_Dm[1, 1], 0.0),
+        vec3(0.0, 0.0, 1.)
     )
     W[e] = (wp.determinant(Dm) / 2.0)
 
@@ -253,22 +254,22 @@ class BW98ThinShell(SifakisFEM):
         self.triplets = Triplets()
         self.triplets.rows = wp.zeros((self.n_tets * 3 * 3), dtype = int)
         self.triplets.cols = wp.zeros_like(self.triplets.rows)
-        self.triplets.vals = wp.zeros((self.n_tets * 3 * 3), dtype = wp.mat33)
+        self.triplets.vals = wp.zeros((self.n_tets * 3 * 3), dtype = mat33)
 
         wp.launch(shell_kernel_sparse, (self.n_tets,), inputs = [self.xcs, self.geo, self.Bm, self.W, self.triplets, self.b]) 
     
 @wp.func 
-def should_fix(x: wp.vec3): 
+def should_fix(x: vec3): 
     p1 = wp.abs(x[0] + 0.5) < eps and wp.abs(x[2] + 0.5) < eps
     p2 = wp.abs(x[0] - 0.5) < eps and wp.abs(x[2] + 0.5) < eps
     return p1 or p2 
 
 @wp.kernel
-def set_b_fixed(geo: FEMMesh,b: wp.array(dtype = wp.vec3)):
+def set_b_fixed(geo: FEMMesh,b: wp.array(dtype = vec3)):
     i = wp.tid()
     # set fixed points rhs to 0
     if should_fix(geo.xcs[i]): 
-        b[i] = wp.vec3(0.0, 0.0, 0.0)
+        b[i] = vec3(0.0, 0.0, 0.0)
 
 @wp.kernel
 def set_K_fixed(geo: FEMMesh, triplets: Triplets):
@@ -278,9 +279,9 @@ def set_K_fixed(geo: FEMMesh, triplets: Triplets):
     
     if should_fix(geo.xcs[i]) or should_fix(geo.xcs[j]):        
         if i == j:
-            triplets.vals[eij] = wp.identity(3, dtype = float)
+            triplets.vals[eij] = wp.identity(3, dtype = scalar)
         else:
-            triplets.vals[eij] = wp.mat33(0.0)
+            triplets.vals[eij] = mat33(0.0)
 
 # @wp.kernel
 # def set_Q_fixed(geo: FEMMesh, triplets: Triplets):
@@ -289,10 +290,10 @@ def set_K_fixed(geo: FEMMesh, triplets: Triplets):
 #     j = triplets.cols[eij]
     
 #     if should_fix(geo.xcs[i]) or should_fix(geo.xcs[j]):        
-#         triplets.vals[eij] = wp.mat33(0.0)
+#         triplets.vals[eij] = mat33(0.0)
 
 class Shell(RodBCBase, BW98ThinShell, TOBJComplex):
-    def __init__(self, h, meshes_filename = [default_shell], transforms = [np.identity(4, dtype = float)]): 
+    def __init__(self, h, meshes_filename = [default_shell], transforms = [np.identity(4, dtype = scalar)]): 
         self.meshes_filename = meshes_filename
         self.transforms = transforms
 
@@ -320,9 +321,9 @@ class Shell(RodBCBase, BW98ThinShell, TOBJComplex):
         # wp.launch(shell_kernel_sparse, (self.n_tets,), inputs = [self.xcs, self.geo, self.Bm, self.W, self.triplets, self.b]) 
         # b0 = self.b.numpy().copy()
         x0 = self.xcs.numpy().reshape(-1)
-        K_fd = np.zeros((self.n_nodes * 3, self.n_nodes * 3), dtype = float)
+        K_fd = np.zeros((self.n_nodes * 3, self.n_nodes * 3), dtype = scalar)
         for i in range(9):
-            ei = np.zeros((12,), dtype = float)
+            ei = np.zeros((12,), dtype = scalar)
             ei[i + 3] = 1.0 
             x = x0 + h_fd * ei 
             self.states.x.assign(x.reshape(-1, 3)) 
@@ -351,10 +352,10 @@ class Shell(RodBCBase, BW98ThinShell, TOBJComplex):
         triplets = Triplets()
         triplets.rows = wp.zeros((n_edges * 4 * 4), dtype = int)
         triplets.cols = wp.zeros_like(triplets.rows)
-        triplets.vals = wp.zeros((n_edges * 4 * 4), dtype = wp.mat33)
+        triplets.vals = wp.zeros((n_edges * 4 * 4), dtype = mat33)
         
         wp.launch(quadratic_bending, (n_edges,), inputs = [self.geo, topo, triplets, self.W])
-        self.Q = bsr_zeros(self.n_nodes, self.n_nodes, wp.mat33)
+        self.Q = bsr_zeros(self.n_nodes, self.n_nodes, mat33)
         # wp.launch(set_Q_fixed, (n_edges * 4 * 4,), inputs = [self.geo, triplets])
         bsr_set_from_triplets(self.Q, triplets.rows, triplets.cols, triplets.vals)
 

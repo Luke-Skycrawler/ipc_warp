@@ -3,26 +3,10 @@ from utils.tobj import import_tobj
 import igl
 from typing import List
 import numpy as np
-L, W = 1, 0.2
-mu, rho, lam = 1e6, 1., 125
-g = 10.
-n_x = 20
-n_yz = 4
-dx = L / n_x
-nq = 8
-wq = 1 / nq
-wq_2d = 4
-n_elements, n_nodes = n_yz ** 2 * n_x, (n_yz + 1) ** 2 * (n_x + 1)
-n_tets = n_elements * 6
-n_boundary_elements = n_yz * n_x * 4
-delta = 0.08
-volume = dx ** 3
-area = dx ** 3
-n_unknowns = n_nodes * 3
-
+from .params import *
 
 @wp.func
-def xc(I: int) -> wp.vec3:
+def xc(I: int) -> vec3:
     '''
     coord of nodes
     '''
@@ -31,7 +15,7 @@ def xc(I: int) -> wp.vec3:
     j = i_yz // (n_yz + 1)
     k = i_yz % (n_yz + 1)
 
-    x = wp.vec3(float(i), float(j), float(k))
+    x = vec3(scalar(i), scalar(j), scalar(k))
     return dx * x
 
 @wp.func
@@ -66,10 +50,10 @@ def init_faces_and_tets(faces: wp.array(dtype = wp.vec4i), tet: wp.array(dtype =
 
 
 @wp.kernel
-def init_elements(centers: wp.array(dtype = wp.vec3), faces: wp.array(dtype = wp.vec4i), indices: wp.array(dtype = int), T: wp.array2d(dtype = int), tet: wp.array(dtype = wp.vec4i), nodes: wp.array2d(dtype = int)):
+def init_elements(centers: wp.array(dtype = vec3), faces: wp.array(dtype = wp.vec4i), indices: wp.array(dtype = int), T: wp.array2d(dtype = int), tet: wp.array(dtype = wp.vec4i), nodes: wp.array2d(dtype = int)):
     _e = wp.tid()
     e = _trans(_e)
-    centers[_e] = xc(e) + 0.5 * dx * wp.vec3(1.0)
+    centers[_e] = xc(e) + 0.5 * dx * vec3(1.0)
     for i in range(2):
         for j in range(2):
             for k in range(2):
@@ -91,7 +75,7 @@ def init_elements(centers: wp.array(dtype = wp.vec3), faces: wp.array(dtype = wp
 
 
 @wp.kernel
-def init_nodes(xcs: wp.array(dtype = wp.vec3)):
+def init_nodes(xcs: wp.array(dtype = vec3)):
     i = wp.tid()
     xcs[i] = xc(i)
 
@@ -109,10 +93,10 @@ class RodGeometryGenerator:
     def __init__(self):
         self.indices = wp.zeros((n_elements * 12 * 3), dtype = int)
         self.nodes = wp.zeros((n_elements, 8), dtype = int)
-        self.centers = wp.zeros((n_elements), dtype = wp.vec3)
-        self.xcs = wp.zeros((n_nodes), dtype = wp.vec3)
+        self.centers = wp.zeros((n_elements), dtype = vec3)
+        self.xcs = wp.zeros((n_nodes), dtype = vec3)
         self.faces = wp.zeros((6), dtype= wp.vec4i)
-        self.boundary_centers = wp.zeros((n_boundary_elements), dtype = wp.vec3)
+        self.boundary_centers = wp.zeros((n_boundary_elements), dtype = vec3)
         self.T = wp.zeros((n_tets, 4), int)
         self.tet = wp.zeros((6), dtype = wp.vec4i)
 
@@ -138,7 +122,7 @@ class TOBJLoader:
             
         self.n_nodes = V.shape[0]
         self.n_tets = T.shape[0]
-        self.xcs = wp.zeros((self.n_nodes), dtype = wp.vec3)
+        self.xcs = wp.zeros((self.n_nodes), dtype = vec3)
         self.T = wp.zeros((self.n_tets, 4), dtype = int)
 
         self.T.assign(T)
@@ -151,11 +135,11 @@ class TOBJLoader:
 
 
 @wp.func
-def plane_normal(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> wp.vec3:
+def plane_normal(v0: vec3, v1: vec3, v2: vec3) -> vec3:
     return wp.normalize(wp.cross(v1 - v0, v2 - v0))
 
 @wp.kernel
-def flip_face(verts: wp.array(dtype = wp.vec3), normals: wp.array(dtype = wp.vec3), indices: wp.array(dtype = int)):
+def flip_face(verts: wp.array(dtype = vec3), normals: wp.array(dtype = vec3), indices: wp.array(dtype = int)):
     i = wp.tid()
     n = normals[i]
     i0 = indices[i * 3 + 0]
@@ -169,7 +153,7 @@ def flip_face(verts: wp.array(dtype = wp.vec3), normals: wp.array(dtype = wp.vec
         indices[i * 3 + 2] = i1
 
 @wp.kernel
-def verify_normals(verts: wp.array(dtype = wp.vec3), normals: wp.array(dtype = wp.vec3), indices: wp.array(dtype = int)):
+def verify_normals(verts: wp.array(dtype = vec3), normals: wp.array(dtype = vec3), indices: wp.array(dtype = int)):
     i = wp.tid()
     i0 = indices[i * 3 + 0]
     i1 = indices[i * 3 + 1] 
@@ -191,15 +175,15 @@ class TOBJComplex:
         self.n_nodes = 0
         self.n_tets = 0
         self.tet_start = []
-        V = np.zeros((0, 3), dtype = float)
+        V = np.zeros((0, 3), dtype = scalar)
         T = np.zeros((0, 4), dtype = int)
         F_from_file = np.zeros((0, 3), dtype = int)
         F = np.zeros((0, 3), dtype = int)
-        uv = np.zeros((0, 3), dtype = float)
+        uv = np.zeros((0, 3), dtype = scalar)
         # only used as rest shape in cloth simulation
 
         while len(transforms) < len(meshes_filename):
-            transforms.append(np.identity(4, dtype = float))
+            transforms.append(np.identity(4, dtype = scalar))
         
         assert(len(transforms) == len(meshes_filename))
         for f, trans in zip(meshes_filename, transforms):
@@ -214,13 +198,13 @@ class TOBJComplex:
                 t = np.zeros((0, 4), int)
                 if tc is not None and tc.shape[0]:
                     if tc.shape[1] == 2:
-                        tc = np.hstack((tc, np.zeros((tc.shape[0], 1), dtype = float)))
+                        tc = np.hstack((tc, np.zeros((tc.shape[0], 1), dtype = scalar)))
                     uv = np.vstack((uv, tc))
             
-            v4 = np.ones((v.shape[0], 4), dtype = float)
+            v4 = np.ones((v.shape[0], 4), dtype = scalar)
             v4[:, :3] = v
             v = (v4 @ trans.T)[:, :3] 
-            # V = np.vstack((V, v), dtype = float)
+            # V = np.vstack((V, v), dtype = scalar)
             V = np.vstack((V, v))
             if t.shape[0]:
                 T = np.vstack((T, t + self.n_nodes))
@@ -232,14 +216,14 @@ class TOBJComplex:
             self.n_tets += t.shape[0]
 
         self.tet_start.append(self.n_tets)
-        self.xcs = wp.zeros((self.n_nodes), dtype = wp.vec3) 
+        self.xcs = wp.zeros((self.n_nodes), dtype = vec3) 
         self.xcs.assign(V)
 
         if uv.shape[0]:
             # u, v only defined for cloth  
             assert uv.shape[0] == self.n_nodes
-            self.u = wp.zeros((self.n_nodes, ), dtype = float)
-            self.v = wp.zeros((self.n_nodes, ), dtype = float)
+            self.u = wp.zeros((self.n_nodes, ), dtype = scalar)
+            self.v = wp.zeros((self.n_nodes, ), dtype = scalar)
             
             self.u.assign(uv[:, 0])
             self.v.assign(uv[:, 1])
@@ -265,9 +249,9 @@ class TOBJComplex:
         F = np.vstack([F, F_from_file])
         self.indices = wp.array(F.reshape(-1), dtype = int)
         self.n_faces = F.shape[0] 
-        n0 = np.ones(3, dtype = float)
+        n0 = np.ones(3, dtype = scalar)
         self.N = N = igl.per_face_normals(V, F, n0)
-        normals = wp.array(N, dtype = wp.vec3)
+        normals = wp.array(N, dtype = vec3)
         
         # wp.launch(flip_face, (self.indices.shape[0] // 3,), inputs = [self.xcs, normals, self.indices])
         # wp.launch(verify_normals, (self.indices.shape[0] // 3,), inputs = [self.xcs, normals, self.indices])
