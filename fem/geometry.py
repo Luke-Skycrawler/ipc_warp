@@ -242,7 +242,8 @@ class TOBJComplex(SimComplexBase):
                 ff = igl.boundary_facets(t)  
                 ff, _ = igl.bfs_orient(ff)
                 c, _ = igl.orientable_patches(ff)
-                F, _ = igl.orient_outward(v, ff, c)
+                ff, _ = igl.orient_outward(v, ff, c)
+                v = (np.hstack((v, np.ones((v.shape[0], 1), dtype = scalar))) @ trans.T)[:, :3]
 
             elif f.endswith(".mesh"):
                 v, t, _ = igl.read_mesh(f)

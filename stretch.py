@@ -21,16 +21,17 @@ from ipctkwp.distance.point_edge import point_edge_distance_gradient_hessian
 from fem.geometry import Soup
 
 eps = 3e-4
-h = 1e-2
+h = 2e-3
 rho = 1e3
 omega = 3.0
 boundary_v = 1.0
 
 quasi_static = False
 twist = True
+dirichlet_boundary = True
 attachment_stiffness = scalar(1e8)
 
-contact_stiffness = scalar(1e5)
+contact_stiffness = scalar(1e7)
 wp.config.max_unroll = 1
 wp.config.enable_backward = False
 
@@ -69,7 +70,7 @@ def should_fix(x: vec3):
     ret = False
     if wp.static(twist): 
         ret = x[0] < -0.5 + eps or x[0] > 0.5 - eps
-    else:
+    elif wp.static(dirichlet_boundary):
         ret = x[0] < -0.5 + eps 
     return ret
 
@@ -483,11 +484,57 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         
         super().compute_A()
         bsr_axpy(collision_hess, self.K_sparse, h * h, 1.0)
-        
+    def compute_collision_energy(self):
+        self.detect_collision()
+        e = wp.zeros((1,), dtype = scalar)
+        wp.launch(contact_energy_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, e])
+        wp.launch(contact_energy_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, e])
+        return e.numpy()[0] * self.h * self.h
+
+@wp.kernel
+def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar)):
+    i = wp.tid()
+    c = contacts[i]
+    
+    dist, v0, v1 = fetch_dist_v0v1(states, soup, c)
+    
+    if dist < c.l0:
+        dl = dist - c.l0
+        energy = contact_stiffness * dl * dl
+        wp.atomic_add(e, 0, energy)
+
+@wp.kernel
+def contact_energy_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar)):
+    i = wp.tid()
+    c = contacts[i]
+    dist, v0, v1 = fetch_dist_v0v1_pt(states, soup, c)
+
+    if dist < c.l0:
+        dl = dist - c.l0
+        energy = contact_stiffness * dl * dl
+        wp.atomic_add(e, 0, energy)
+
 def drape():
     # rod = RodBC(h, "assets/elephant.mesh")
     # rod = RodBC(h)
+
+    # n_meshes = 2 
+    # meshes = ["assets/bar2.tobj"] * n_meshes
+    # # meshes = ["assets/bunny_5.tobj"] * n_meshes
+    # transforms = [np.identity(4, dtype = float) for _ in range(n_meshes)]
+    # transforms[1][:3, :3] = np.zeros((3, 3))
+    # transforms[1][0, 1] = 1
+    # transforms[1][1, 0] = 1
+    # transforms[1][2, 2] = 1
+
+    # for i in range(n_meshes):
+    #     # transforms[i][0, 3] = i * 0.5
+    #     transforms[i][1, 3] = 1.2 + i * 0.2
+    #     transforms[i][2, 3] = i * 1.0
+
     rod = RodComplexBC(h, meshes = ["assets/bar2.tobj"], transforms = [np.eye(4)])
+    # rod = RodComplexBC(h, meshes = meshes, transforms = transforms)
+
     viewer = PSViewer(rod)
     ps.set_user_callback(viewer.callback)
     ps.set_ground_plane_mode("none")
