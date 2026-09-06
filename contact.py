@@ -16,7 +16,7 @@ buffer = _thickness
 eps = 1e-6
 FLT_MAX = 1e5
 ZERO = 1e-6
-enable_self_collision = False
+disable_self_collision = False
 
 '''
 TODO: make sure max_unroll = 0 before importing this module
@@ -42,6 +42,11 @@ def c_gets_i_mod_2(color: wp.array(dtype = int)):
 def _copy(dst: wp.array(dtype = wp.vec3), src: wp.array(dtype = vec3)):
     i = wp.tid()
     dst[i] = wp.vec3(src[i])
+
+@wp.kernel
+def _negate(dst: wp.array(dtype = vec3), src: wp.array(dtype = vec3)):
+    i = wp.tid()
+    dst[i] = -src[i]
 
 # @wp.struct 
 # class ContactInfo:
@@ -186,7 +191,7 @@ def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thicknes
             connected = soup.edges[i * 2] == soup.edges[j * 2] or soup.edges[i * 2] == soup.edges[j * 2 + 1] or soup.edges[i * 2 + 1] == soup.edges[j * 2] or soup.edges[i * 2 + 1] == soup.edges[j * 2 + 1]
 
             self_collision = False
-            if wp.static(enable_self_collision):
+            if wp.static(disable_self_collision):
                 self_collision = soup.body[a1] == soup.body[soup.edges[j * 2]]
             if i < j and not connected and not self_collision: 
                 b1 = soup.edges[j * 2]
@@ -287,7 +292,7 @@ def point_triangle_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thi
             connected = soup.triangles[j * 3] == i or soup.triangles[j * 3 + 1] == i or soup.triangles[j * 3 + 2] == i
 
             self_collision = False
-            if wp.static(enable_self_collision):
+            if wp.static(disable_self_collision):
                 self_collision = soup.body[i] == soup.body[soup.triangles[j * 3]]
             
             if not connected and not self_collision: 
@@ -359,6 +364,7 @@ class ContactSolverBase:
         self.ccd_edge_upper = wp.zeros((n_edges,), dtype=wp.vec3)
         self.ccd_edge_bvh = wp.Bvh(self.ccd_edge_lower, self.ccd_edge_upper)
         self.ccd_toi = wp.ones((1,), dtype=scalar)
+        self.ccd_dx = wp.zeros_like(self.soup.x_transformed)
         
         # triangles 
         self.has_triangles = self.soup.triangles.shape[0] > 0
@@ -409,13 +415,14 @@ class ContactSolverBase:
         self.n_contacts_pt = 0
 
     def collision_free_step(self, dx):
-        """Return a zero-thickness CCD upper bound for x -> x + dx."""
+        """Return a zero-thickness CCD upper bound for the solver update x -= alpha * dx."""
         n_edges = self.soup.edges.shape[0] // 2
         padding = scalar(1e-7)
+        wp.launch(_negate, self.soup.x_transformed.shape[0], inputs=[self.ccd_dx, dx])
         wp.launch(
             swept_edge_aabbs,
             n_edges,
-            inputs=[self.soup.x_transformed, dx, self.soup.edges,
+            inputs=[self.soup.x_transformed, self.ccd_dx, self.soup.edges,
                     self.ccd_edge_lower, self.ccd_edge_upper, padding],
         )
         self.ccd_edge_bvh.refit()
@@ -423,9 +430,9 @@ class ContactSolverBase:
         wp.launch(
             edge_edge_toi,
             n_edges,
-            inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, dx,
+            inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, self.ccd_dx,
                     self.soup.edges, self.soup.body, self.ccd_edge_lower,
-                    self.ccd_edge_upper, self.ccd_toi, enable_self_collision],
+                    self.ccd_edge_upper, self.ccd_toi, disable_self_collision],
         )
 
         if self.has_triangles:
@@ -433,16 +440,16 @@ class ContactSolverBase:
             wp.launch(
                 swept_triangle_aabbs,
                 n_triangles,
-                inputs=[self.soup.x_transformed, dx, self.soup.triangles,
+                inputs=[self.soup.x_transformed, self.ccd_dx, self.soup.triangles,
                         self.ccd_triangle_lower, self.ccd_triangle_upper, padding],
             )
             self.ccd_triangle_bvh.refit()
             wp.launch(
                 point_triangle_toi,
                 self.soup.x_transformed.shape[0],
-                inputs=[self.ccd_triangle_bvh.id, self.soup.x_transformed, dx,
+                inputs=[self.ccd_triangle_bvh.id, self.soup.x_transformed, self.ccd_dx,
                         self.soup.triangles, self.soup.body, self.ccd_toi,
-                        padding, enable_self_collision],
+                        padding, disable_self_collision],
             )
 
         toi = float(self.ccd_toi.numpy()[0])

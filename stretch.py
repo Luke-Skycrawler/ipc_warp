@@ -17,6 +17,7 @@ from contact import ContactSolverBase, XConstraint, fetch_dist_v0v1, fetch_dist_
 
 from ipctkwp.distance.edge_edge import x_to_grad_psd_hess_ee
 from ipctkwp.distance.point_triangle import x_to_grad_psd_hess_pt
+from ipctkwp.distance.barrier import ipc_barrier, ipc_barrier_derivative, ipc_barrier_derivative2
 
 from fem.geometry import Soup
 
@@ -32,8 +33,8 @@ twist = True
 dirichlet_boundary = True
 attachment_stiffness = scalar(1e7)
 
-contact_stiffness = scalar(1e8)
-solver_choice = "cg"
+contact_stiffness = scalar(1e3)
+solver_choice = "ldlt"
 wp.config.max_unroll = 1
 wp.config.enable_backward = False
 
@@ -665,11 +666,12 @@ def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         grad, hess = edge_edge_distance_gradient_hessian(x0, x1, x2, x3)
         d2 = dist * dist
         d02 = c.l0 * c.l0
-        scale = scalar(2.0) * contact_stiffness
-        hess = scale * (wp.outer(grad, grad) + (d2 - d02) * hess)
+        barrier_grad = ipc_barrier_derivative(d2, d02, contact_stiffness)
+        barrier_hess = ipc_barrier_derivative2(d2, d02, contact_stiffness)
+        hess = barrier_hess * wp.outer(grad, grad) + barrier_grad * hess
         hess = project_spd_12(hess)
         # self.b stores force; compute_rhs later converts it to an energy gradient.
-        grad *= scale * (d02 - d2)
+        grad *= -barrier_grad
 
         for ii in range(4):
             gii = vec3(grad[ii * 3 + 0], grad[ii * 3 + 1], grad[ii * 3 + 2])
@@ -703,11 +705,12 @@ def contact_hessian_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         grad, hess = point_triangle_distance_gradient_hessian(x0, x1, x2, x3)
         d2 = dist * dist
         d02 = c.l0 * c.l0
-        scale = scalar(2.0) * contact_stiffness
-        hess = scale * (wp.outer(grad, grad) + (d2 - d02) * hess)
+        barrier_grad = ipc_barrier_derivative(d2, d02, contact_stiffness)
+        barrier_hess = ipc_barrier_derivative2(d2, d02, contact_stiffness)
+        hess = barrier_hess * wp.outer(grad, grad) + barrier_grad * hess
         hess = project_spd_12(hess)
         # self.b stores force; compute_rhs later converts it to an energy gradient.
-        grad *= scale * (d02 - d2)
+        grad *= -barrier_grad
 
         for ii in range(4):
             gii = vec3(grad[ii * 3 + 0], grad[ii * 3 + 1], grad[ii * 3 + 2])
@@ -766,8 +769,7 @@ def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype 
     dist, v0, v1 = fetch_dist_v0v1(states, soup, c)
     
     if dist < c.l0:
-        dl = dist * dist - c.l0 * c.l0
-        energy = contact_stiffness * dl * dl
+        energy = ipc_barrier(dist * dist, c.l0 * c.l0, contact_stiffness)
         wp.atomic_add(e, 0, energy)
 
 @wp.kernel
@@ -777,8 +779,7 @@ def contact_energy_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype 
     dist, v0, v1 = fetch_dist_v0v1_pt(states, soup, c)
 
     if dist < c.l0:
-        dl = dist * dist - c.l0 * c.l0
-        energy = contact_stiffness * dl * dl
+        energy = ipc_barrier(dist * dist, c.l0 * c.l0, contact_stiffness)
         wp.atomic_add(e, 0, energy)
 
 def drape():
