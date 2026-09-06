@@ -33,7 +33,7 @@ dirichlet_boundary = True
 attachment_stiffness = scalar(1e7)
 
 contact_stiffness = scalar(1e8)
-solver_choice = "ldlt"
+solver_choice = "cg"
 wp.config.max_unroll = 1
 wp.config.enable_backward = False
 
@@ -310,7 +310,7 @@ class RodBCBase:
     def step(self):
         newton_iter = True
         n_iter = 0
-        max_iter = 8
+        max_iter = 100
         # while n_iter < max_iter:
         while newton_iter:
             self.compute_A()
@@ -414,7 +414,7 @@ class RodBCBase:
                 direct_solver.factorize()
                 direct_solver.solve(self.b.ptr, self.states.dx.ptr)
     def line_search_fixed(self):
-        alpha = 1.0
+        alpha = self.line_search_upper_bound()
         wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, alpha])
         return alpha
         
@@ -424,7 +424,8 @@ class RodBCBase:
         # FIXME: not converged
         x_tmp = wp.clone(self.states.x)
         E0 = self.compute_psi() + self.compute_inertia() + self.compute_collision_energy()
-        alpha = 1.0
+        upper_bound = self.line_search_upper_bound()
+        alpha = upper_bound
         while True:
             wp.copy(self.states.x, x_tmp)
             wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, alpha])
@@ -438,8 +439,11 @@ class RodBCBase:
                 break
             alpha *= 0.5
 
-        print(f"alpha = {alpha}, E0 = {E0}, E1 = {E1}")
+        print(f"alpha = {alpha}, E0 = {E0}, E1 = {E1}, upper bound = {upper_bound}")
         return alpha
+
+    def line_search_upper_bound(self):
+        return 1.0
 
     def compute_collision_energy(self):
         return 0.0
@@ -727,6 +731,9 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         RodBCBase.__init__(self, h)
         self.soup.x_transformed = self.states.x
         ContactSolverBase.__init__(self)
+
+    def line_search_upper_bound(self):
+        return self.collision_free_step(self.states.dx)
     
     def compute_A(self):
         self.detect_collision()

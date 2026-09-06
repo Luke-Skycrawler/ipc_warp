@@ -3,6 +3,12 @@ import numpy as np
 from scalar_types import *
 from fem.geometry import Soup
 from fem.params import NewtonState
+from ccd.ccd import (
+    edge_edge_toi,
+    point_triangle_toi,
+    swept_edge_aabbs,
+    swept_triangle_aabbs,
+)
 _thickness = 0.01
 contact_volume = 10000
 # buffer = 0.01
@@ -347,6 +353,12 @@ class ContactSolverBase:
         self.bvh_edges_upper = wp.zeros((n_edges, ), dtype = wp.vec3)
         self.compute_edge_aabbs()
         self.bvh_edges = wp.Bvh(self.bvh_edges_lower, self.bvh_edges_upper)
+
+        # Separate swept BVHs used to cap a Newton step before energy backtracking.
+        self.ccd_edge_lower = wp.zeros((n_edges,), dtype=wp.vec3)
+        self.ccd_edge_upper = wp.zeros((n_edges,), dtype=wp.vec3)
+        self.ccd_edge_bvh = wp.Bvh(self.ccd_edge_lower, self.ccd_edge_upper)
+        self.ccd_toi = wp.ones((1,), dtype=scalar)
         
         # triangles 
         self.has_triangles = self.soup.triangles.shape[0] > 0
@@ -355,6 +367,10 @@ class ContactSolverBase:
             # must be wp.vec3 type to construct the mesh bvh 
             # sync with self.soup.x_transformed in compute_V()
             self.tri_mesh = wp.Mesh(self.x_mesh, self.soup.triangles)
+            n_triangles = self.soup.triangles.shape[0] // 3
+            self.ccd_triangle_lower = wp.zeros((n_triangles,), dtype=wp.vec3)
+            self.ccd_triangle_upper = wp.zeros((n_triangles,), dtype=wp.vec3)
+            self.ccd_triangle_bvh = wp.Bvh(self.ccd_triangle_lower, self.ccd_triangle_upper)
         
 
         # color 
@@ -391,6 +407,46 @@ class ContactSolverBase:
         self.contacts_pt.htable = self.contacts_htable_pt
 
         self.n_contacts_pt = 0
+
+    def collision_free_step(self, dx):
+        """Return a zero-thickness CCD upper bound for x -> x + dx."""
+        n_edges = self.soup.edges.shape[0] // 2
+        padding = scalar(1e-7)
+        wp.launch(
+            swept_edge_aabbs,
+            n_edges,
+            inputs=[self.soup.x_transformed, dx, self.soup.edges,
+                    self.ccd_edge_lower, self.ccd_edge_upper, padding],
+        )
+        self.ccd_edge_bvh.refit()
+        self.ccd_toi.fill_(1.0)
+        wp.launch(
+            edge_edge_toi,
+            n_edges,
+            inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, dx,
+                    self.soup.edges, self.soup.body, self.ccd_edge_lower,
+                    self.ccd_edge_upper, self.ccd_toi, enable_self_collision],
+        )
+
+        if self.has_triangles:
+            n_triangles = self.soup.triangles.shape[0] // 3
+            wp.launch(
+                swept_triangle_aabbs,
+                n_triangles,
+                inputs=[self.soup.x_transformed, dx, self.soup.triangles,
+                        self.ccd_triangle_lower, self.ccd_triangle_upper, padding],
+            )
+            self.ccd_triangle_bvh.refit()
+            wp.launch(
+                point_triangle_toi,
+                self.soup.x_transformed.shape[0],
+                inputs=[self.ccd_triangle_bvh.id, self.soup.x_transformed, dx,
+                        self.soup.triangles, self.soup.body, self.ccd_toi,
+                        padding, enable_self_collision],
+            )
+
+        toi = float(self.ccd_toi.numpy()[0])
+        return 0.9 * toi if toi < 1.0 else 1.0
 
     def update_bvh(self):
         self.compute_edge_aabbs()
