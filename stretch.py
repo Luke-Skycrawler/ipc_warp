@@ -9,6 +9,7 @@ from warp.sparse import *
 from fem.params import FEMMesh, mu, lam, gravity, gravity_np
 from fem.fem import tet_kernel, tet_kernel_sparse, Triplets, psi
 from warp.optim.linear import bicgstab, cg
+from dxslv import CUSolverDevice
 from geometry.static_scene import StaticScene
 from warp.fem.linalg import array_axpy
 from scalar_types import *
@@ -20,8 +21,9 @@ from ipctkwp.distance.point_edge import point_edge_distance_gradient_hessian
 
 from fem.geometry import Soup
 
+vel_tol = 5e-2
 eps = 3e-4
-h = 2e-3
+h = 8e-3
 rho = 1e3
 omega = 3.0
 boundary_v = 1.0
@@ -32,8 +34,42 @@ dirichlet_boundary = True
 attachment_stiffness = scalar(1e8)
 
 contact_stiffness = scalar(1e7)
+solver_choice = "cg"
 wp.config.max_unroll = 1
 wp.config.enable_backward = False
+
+
+@wp.kernel
+def bsr_to_scalar_csr(
+    block_offsets: wp.array(dtype=int),
+    block_columns: wp.array(dtype=int),
+    block_values: wp.array(dtype=mat33),
+    scalar_offsets: wp.array(dtype=int),
+    scalar_columns: wp.array(dtype=int),
+    scalar_values: wp.array(dtype=scalar),
+    n_block_rows: int,
+):
+    scalar_row = wp.tid()
+    if scalar_row == n_block_rows * 3:
+        scalar_offsets[scalar_row] = block_offsets[n_block_rows] * 9
+        return
+
+    block_row = scalar_row // 3
+    row_in_block = scalar_row % 3
+    block_begin = block_offsets[block_row]
+    block_end = block_offsets[block_row + 1]
+    blocks_in_row = block_end - block_begin
+    scalar_begin = block_begin * 9 + row_in_block * blocks_in_row * 3
+    scalar_offsets[scalar_row] = scalar_begin
+
+    for block_index in range(block_begin, block_end):
+        block_column = block_columns[block_index]
+        output = scalar_begin + (block_index - block_begin) * 3
+        for column_in_block in range(3):
+            scalar_columns[output + column_in_block] = block_column * 3 + column_in_block
+            scalar_values[output + column_in_block] = block_values[block_index][
+                row_in_block, column_in_block
+            ]
 
 @wp.kernel
 def set_M_diag(d: wp.array(dtype = scalar), M: wp.array(dtype = mat33)):  
@@ -133,13 +169,15 @@ def compute_Psi(x: wp.array(dtype = vec3), geo: FEMMesh, Bm: wp.array(dtype = ma
 @wp.kernel
 def compute_inertia(geo: FEMMesh, state: NewtonState, M: wp.array(dtype = scalar), inert: wp.array(dtype = scalar), comp_x: wp.array(dtype = vec3), h: scalar):
     i = wp.tid()
-
-    # if not should_fix(geo.xcs[i]):
-    if True:
+    de = scalar(0.0)
+    if not should_fix(geo.xcs[i]):
+    # if True:
         dx = x_minus_tilde(state, h, i)
-        de = wp.length_sq(dx) * M[i] * scalar(0.5) + wp.dot(comp_x[i], state.x[i])
+        de = wp.length_sq(dx) * M[i] * scalar(0.5)
         # de = wp.dot(comp_x[i], state.x[i])
-        wp.atomic_add(inert, 0, de)
+    else: 
+        de = wp.dot(comp_x[i], state.x[i])
+    wp.atomic_add(inert, 0, de)
 
 @wp.kernel
 def compute_compensation(state: NewtonState, geo: FEMMesh, theta: scalar, comp_x: wp.array(dtype = vec3)):
@@ -289,8 +327,8 @@ class RodBCBase:
                 break
 
             dxnp = self.states.dx.numpy()
-            norm_dx = np.linalg.norm(dxnp)
-            newton_iter = norm_dx > 1e-4 and n_iter < max_iter
+            norm_dx = np.max(dxnp)
+            newton_iter = norm_dx > vel_tol * h and n_iter < max_iter
             print(f"norm = {np.linalg.norm(dxnp)}, {n_iter}")
             n_iter += 1
         self.update_x0_xdot()
@@ -343,10 +381,39 @@ class RodBCBase:
 
     def solve(self):
         with wp.ScopedTimer("solve"):
-            self.states.dx.zero_()
-            # bicgstab(self.A, self.b, self.states.dx, 1e-6, maxiter = 100)
-            cg(self.A, self.b, self.states.dx, 1e-6, use_cuda_graph = True)
-    
+            if solver_choice == "cg":
+                self.states.dx.zero_()
+                # bicgstab(self.A, self.b, self.states.dx, 1e-6, maxiter = 100)
+                cg(self.A, self.b, self.states.dx, 1e-6, use_cuda_graph = True)
+            elif solver_choice == "ldlt":
+                n = self.A.shape[0]
+                block_nnz = self.A.nnz_sync()
+                scalar_nnz = block_nnz * 9
+                offsets = wp.empty(n + 1, dtype=int, device=self.A.device)
+                columns = wp.empty(scalar_nnz, dtype=int, device=self.A.device)
+                values = wp.empty(scalar_nnz, dtype=scalar, device=self.A.device)
+
+                wp.launch(
+                    bsr_to_scalar_csr,
+                    dim=n + 1,
+                    inputs=[
+                        self.A.offsets,
+                        self.A.columns,
+                        self.A.values,
+                        offsets,
+                        columns,
+                        values,
+                        self.A.nrow,
+                    ],
+                    device=self.A.device,
+                )
+
+                direct_solver = CUSolverDevice(
+                    offsets.ptr, columns.ptr, values.ptr, n, scalar_nnz
+                )
+                direct_solver.analyze_pattern()
+                direct_solver.factorize()
+                direct_solver.solve(self.b.ptr, self.states.dx.ptr)
     def line_search_fixed(self):
         alpha = 1.0
         wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, alpha])
@@ -366,7 +433,7 @@ class RodBCBase:
             
             if E1 < E0:
                 break
-            if alpha < 1e-3:
+            if alpha < 1e-2:
                 wp.copy(self.states.x, x_tmp)
                 alpha = 0.0
                 break
@@ -545,4 +612,3 @@ if __name__ == "__main__":
     ps.init()
     wp.init()
     drape()
-    
