@@ -13,11 +13,10 @@ from dxslv import CUSolverDevice
 from geometry.static_scene import StaticScene
 from warp.fem.linalg import array_axpy
 from scalar_types import *
-from contact import ContactSolverBase, XConstraint, fetch_dist_v0v1, fetch_dist_v0v1_pt
+from contact import ContactSolverBase, XConstraint, fetch_dist_v0v1, fetch_dist_v0v1_pt, closest_point_triangle
 
 from ipctkwp.distance.edge_edge import x_to_grad_psd_hess_ee
 from ipctkwp.distance.point_triangle import x_to_grad_psd_hess_pt
-from ipctkwp.distance.point_edge import point_edge_distance_gradient_hessian
 
 from fem.geometry import Soup
 
@@ -31,10 +30,10 @@ boundary_v = 1.0
 quasi_static = False
 twist = True
 dirichlet_boundary = True
-attachment_stiffness = scalar(1e8)
+attachment_stiffness = scalar(1e7)
 
-contact_stiffness = scalar(1e7)
-solver_choice = "cg"
+contact_stiffness = scalar(1e8)
+solver_choice = "ldlt"
 wp.config.max_unroll = 1
 wp.config.enable_backward = False
 
@@ -461,6 +460,192 @@ class RodBC(RodBCBase, Rod):
         self.filename = filename
         super().__init__(h)
 
+@wp.func
+def embed_point_point_distance(x0: vec3, x1: vec3, o0: int, o1: int):
+    grad = vec12()
+    hess = mat12()
+    d = x0 - x1
+    for i in range(3):
+        grad[o0 * 3 + i] = scalar(2.0) * d[i]
+        grad[o1 * 3 + i] = scalar(-2.0) * d[i]
+        hess[o0 * 3 + i, o0 * 3 + i] = scalar(2.0)
+        hess[o0 * 3 + i, o1 * 3 + i] = scalar(-2.0)
+        hess[o1 * 3 + i, o0 * 3 + i] = scalar(-2.0)
+        hess[o1 * 3 + i, o1 * 3 + i] = scalar(2.0)
+    return grad, hess
+
+@wp.func
+def embed_point_edge_distance(p: vec3, e0: vec3, e1: vec3, op: int, oe0: int, oe1: int):
+    edge = e1 - e0
+    r = p - e0
+    inv_edge_len2 = scalar(1.0) / wp.dot(edge, edge)
+    alpha = wp.dot(r, edge) * inv_edge_len2
+    q = r - alpha * edge
+    coefficients = vec3(scalar(1.0), alpha - scalar(1.0), -alpha)
+    alpha_signs = vec3(scalar(0.0), scalar(1.0), scalar(-1.0))
+    two_alpha_edge = scalar(2.0) * alpha * edge
+    alpha_grad = wp.matrix_from_rows(
+        edge * inv_edge_len2,
+        (two_alpha_edge - r - edge) * inv_edge_len2,
+        (r - two_alpha_edge) * inv_edge_len2,
+    )
+    offsets = wp.vec3i(op, oe0, oe1)
+    grad = vec12()
+    hess = mat12()
+    for i in range(3):
+        oi = offsets[i]
+        for k in range(3):
+            grad[oi * 3 + k] = scalar(2.0) * coefficients[i] * q[k]
+        for j in range(3):
+            oj = offsets[j]
+            block = scalar(2.0) * wp.outer(
+                alpha_signs[i] * q - coefficients[i] * edge,
+                alpha_grad[j],
+            )
+            for k in range(3):
+                for l in range(3):
+                    value = block[k, l]
+                    if k == l:
+                        value += scalar(2.0) * coefficients[i] * coefficients[j]
+                    hess[oi * 3 + k, oj * 3 + l] = value
+    return grad, hess
+
+@wp.func
+def edge_edge_distance_gradient_hessian(x0: vec3, x1: vec3, x2: vec3, x3: vec3):
+    dab = wp.closest_point_edge_edge(wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3), 1.0e-6)
+    s = scalar(dab[0])
+    t = scalar(dab[1])
+    feature_eps = scalar(1.0e-6)
+    s_boundary = s <= feature_eps or s >= scalar(1.0) - feature_eps
+    t_boundary = t <= feature_eps or t >= scalar(1.0) - feature_eps
+
+    if s_boundary and t_boundary:
+        oa = int(0)
+        ob = int(2)
+        pa = x0
+        pb = x2
+        if s >= scalar(1.0) - feature_eps:
+            oa = 1
+            pa = x1
+        if t >= scalar(1.0) - feature_eps:
+            ob = 3
+            pb = x3
+        return embed_point_point_distance(pa, pb, oa, ob)
+
+    if s_boundary:
+        oa = int(0)
+        pa = x0
+        if s >= scalar(1.0) - feature_eps:
+            oa = 1
+            pa = x1
+        return embed_point_edge_distance(pa, x2, x3, oa, 2, 3)
+
+    if t_boundary:
+        ob = int(2)
+        pb = x2
+        if t >= scalar(1.0) - feature_eps:
+            ob = 3
+            pb = x3
+        return embed_point_edge_distance(pb, x0, x1, ob, 0, 1)
+
+    return x_to_grad_psd_hess_ee(x0, x1, x2, x3)
+
+@wp.func
+def point_triangle_distance_gradient_hessian(x0: vec3, x1: vec3, x2: vec3, x3: vec3):
+    dab, feature = closest_point_triangle(wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3))
+    if feature == 0:
+        return embed_point_point_distance(x0, x1, 0, 1)
+    if feature == 1:
+        return embed_point_point_distance(x0, x2, 0, 2)
+    if feature == 2:
+        return embed_point_point_distance(x0, x3, 0, 3)
+    if feature == 3:
+        return embed_point_edge_distance(x0, x1, x2, 0, 1, 2)
+    if feature == 4:
+        return embed_point_edge_distance(x0, x1, x3, 0, 1, 3)
+    if feature == 5:
+        return embed_point_edge_distance(x0, x2, x3, 0, 2, 3)
+    return x_to_grad_psd_hess_pt(x0, x1, x2, x3)
+
+@wp.func
+def project_spd_12(hess: mat12):
+    # Cyclic Jacobi EVD, matching warp-ipc's numerical PSD projection.
+    A = hess
+    V = mat12()
+    eigenvalues = vec12()
+    accumulated = vec12()
+    corrections = vec12()
+    for i in range(12):
+        V[i, i] = scalar(1.0)
+        eigenvalues[i] = A[i, i]
+        accumulated[i] = eigenvalues[i]
+
+    sweep = int(0)
+    while sweep < 4:
+        threshold = scalar(0.0)
+        for j in range(12):
+            for i in range(j):
+                threshold += A[i, j] * A[i, j]
+        threshold = wp.sqrt(threshold) / scalar(48.0)
+        if threshold == scalar(0.0):
+            sweep = 4
+        else:
+            for p in range(12):
+                for q in range(p + 1, 12):
+                    gap = scalar(10.0) * wp.abs(A[p, q])
+                    if threshold <= wp.abs(A[p, q]):
+                        delta = eigenvalues[q] - eigenvalues[p]
+                        t = scalar(0.0)
+                        if wp.abs(delta) + gap == wp.abs(delta):
+                            t = A[p, q] / delta
+                        else:
+                            theta = scalar(0.5) * delta / A[p, q]
+                            t = scalar(1.0) / (wp.abs(theta) + wp.sqrt(scalar(1.0) + theta * theta))
+                            if theta < scalar(0.0):
+                                t = -t
+                        c = scalar(1.0) / wp.sqrt(scalar(1.0) + t * t)
+                        s = t * c
+                        tau = s / (scalar(1.0) + c)
+                        rotation = t * A[p, q]
+                        corrections[p] -= rotation
+                        corrections[q] += rotation
+                        eigenvalues[p] -= rotation
+                        eigenvalues[q] += rotation
+                        A[p, q] = scalar(0.0)
+                        for j in range(p):
+                            g = A[j, p]
+                            h = A[j, q]
+                            A[j, p] = g - s * (h + g * tau)
+                            A[j, q] = h + s * (g - h * tau)
+                        for j in range(p + 1, q):
+                            g = A[p, j]
+                            h = A[j, q]
+                            A[p, j] = g - s * (h + g * tau)
+                            A[j, q] = h + s * (g - h * tau)
+                        for j in range(q + 1, 12):
+                            g = A[p, j]
+                            h = A[q, j]
+                            A[p, j] = g - s * (h + g * tau)
+                            A[q, j] = h + s * (g - h * tau)
+                        for j in range(12):
+                            g = V[j, p]
+                            h = V[j, q]
+                            V[j, p] = g - s * (h + g * tau)
+                            V[j, q] = h + s * (g - h * tau)
+            for i in range(12):
+                accumulated[i] += corrections[i]
+                eigenvalues[i] = accumulated[i]
+                corrections[i] = scalar(0.0)
+            sweep += 1
+
+    result = mat12()
+    for k in range(12):
+        eigenvalue = wp.max(eigenvalues[k], scalar(0.0))
+        for i in range(12):
+            for j in range(12):
+                result[i, j] += eigenvalue * V[i, k] * V[j, k]
+    return result
+
 @wp.kernel
 def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), triplets: Triplets, b: wp.array(dtype = vec3)):
     i = wp.tid()
@@ -473,10 +658,14 @@ def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         x1 = states.x[c.a1a2b1b2[1]]
         x2 = states.x[c.a1a2b1b2[2]]
         x3 = states.x[c.a1a2b1b2[3]]
-        grad, hess = x_to_grad_psd_hess_ee(x0, x1, x2, x3)
-
-        grad *= contact_stiffness
-        hess *= contact_stiffness
+        grad, hess = edge_edge_distance_gradient_hessian(x0, x1, x2, x3)
+        d2 = dist * dist
+        d02 = c.l0 * c.l0
+        scale = scalar(2.0) * contact_stiffness
+        hess = scale * (wp.outer(grad, grad) + (d2 - d02) * hess)
+        hess = project_spd_12(hess)
+        # self.b stores force; compute_rhs later converts it to an energy gradient.
+        grad *= scale * (d02 - d2)
 
         for ii in range(4):
             gii = vec3(grad[ii * 3 + 0], grad[ii * 3 + 1], grad[ii * 3 + 2])
@@ -507,10 +696,14 @@ def contact_hessian_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         x1 = states.x[i1]
         x2 = states.x[i2]
         x3 = states.x[i3]
-        grad, hess = x_to_grad_psd_hess_pt(x0, x1, x2, x3)
-
-        grad *= contact_stiffness
-        hess *= contact_stiffness
+        grad, hess = point_triangle_distance_gradient_hessian(x0, x1, x2, x3)
+        d2 = dist * dist
+        d02 = c.l0 * c.l0
+        scale = scalar(2.0) * contact_stiffness
+        hess = scale * (wp.outer(grad, grad) + (d2 - d02) * hess)
+        hess = project_spd_12(hess)
+        # self.b stores force; compute_rhs later converts it to an energy gradient.
+        grad *= scale * (d02 - d2)
 
         for ii in range(4):
             gii = vec3(grad[ii * 3 + 0], grad[ii * 3 + 1], grad[ii * 3 + 2])
@@ -537,6 +730,7 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
     
     def compute_A(self):
         self.detect_collision()
+        super().compute_A()
         
         triplets = Triplets()
         nnz = (self.n_contacts + self.n_contacts_pt) * 4 * 4
@@ -548,8 +742,7 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         wp.launch(contact_hessian_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, triplets, self.b, self.n_contacts])
 
         collision_hess = bsr_from_triplets(self.n_nodes, self.n_nodes, triplets.rows, triplets.cols, triplets.vals)
-        
-        super().compute_A()
+
         bsr_axpy(collision_hess, self.K_sparse, h * h, 1.0)
     def compute_collision_energy(self):
         self.detect_collision()
@@ -566,7 +759,7 @@ def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype 
     dist, v0, v1 = fetch_dist_v0v1(states, soup, c)
     
     if dist < c.l0:
-        dl = dist - c.l0
+        dl = dist * dist - c.l0 * c.l0
         energy = contact_stiffness * dl * dl
         wp.atomic_add(e, 0, energy)
 
@@ -577,7 +770,7 @@ def contact_energy_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype 
     dist, v0, v1 = fetch_dist_v0v1_pt(states, soup, c)
 
     if dist < c.l0:
-        dl = dist - c.l0
+        dl = dist * dist - c.l0 * c.l0
         energy = contact_stiffness * dl * dl
         wp.atomic_add(e, 0, energy)
 
