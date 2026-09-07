@@ -466,22 +466,8 @@ class ContactSolverBase:
         n_edges = self.soup.edges.shape[0] // 2
         wp.launch(edge_aabb, n_edges, inputs = [self.soup.x_transformed, self.soup.edges, self.bvh_edges_lower, self.bvh_edges_upper, _thickness + buffer])
 
-    def colorization(self):
-        n_nodes = self.soup.xcs.shape[0]
-        wp.launch(c_gets_i_mod_2, n_nodes, inputs = [self.color])
-        dirty = True 
-        while (dirty):
-            self.dirty_bit.zero_()
-            wp.launch(color_contacts, (self.n_contacts, ), inputs = [self.contacts, self.color, self.dirty_bit])
-            dirty = self.dirty_bit.numpy().any()
-            # if dirty:
-            #     print("dirty! recoloring...")
-        self.color_cnt = np.max(self.color.numpy()) + 1
-        # print(f"color cnt = {self.color_cnt}")
-        # colornp = self.color.numpy()
-        # print(f"color in contact pairs (19, 20, 21, 59, 60, 61): {colornp[19]}, {colornp[20]}, {colornp[21]}, {colornp[59]}, {colornp[60]}, {colornp[61]}")
-    
     def compute_V(self, ret = True): 
+        # nothing to do since self.soup.x_transformed is tied to  RodComplexBC.states.x
         return None
         
     def detect_collision(self): 
@@ -505,11 +491,6 @@ class ContactSolverBase:
 
             self.n_contacts_pt = self.contacts_pt.cnt.numpy()[0]
             print(f"n pt contacts = {self.n_contacts_pt}")
-
-    def compute_N(self):
-        N = wp.zeros((self.soup.triangles.shape[0] // 3, ), dtype = vec3)
-        wp.launch(compute_normal_kernel, (self.F.shape[0], ), inputs = [self.soup.x_transformed, self.soup.triangles, N])
-        return N.numpy()
 
     def get_contact_points(self):
         wp.launch(get_contact_points, (self.n_contacts,), inputs = [self.history, self.soup, self.contacts_new.list, self.contact_ret])
