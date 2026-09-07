@@ -18,6 +18,7 @@ from contact import ContactSolverBase, XConstraint, fetch_dist_v0v1, fetch_dist_
 from ipctkwp.distance.edge_edge import x_to_grad_psd_hess_ee
 from ipctkwp.distance.point_triangle import x_to_grad_psd_hess_pt
 from ipctkwp.distance.barrier import ipc_barrier, ipc_barrier_derivative, ipc_barrier_derivative2
+from ipctkwp.distance.mollifier import ee_mollifier_derivatives, ee_mollifier_value, ee_mollifier_threshold
 
 from fem.geometry import Soup
 
@@ -572,6 +573,15 @@ def point_triangle_distance_gradient_hessian(x0: vec3, x1: vec3, x2: vec3, x3: v
         return embed_point_edge_distance(x0, x2, x3, 0, 2, 3)
     return x_to_grad_psd_hess_pt(x0, x1, x2, x3)
 
+
+@wp.func
+def ee_mollifier_threshold_rest(soup: Soup, c: XConstraint):
+    i0 = c.a1a2b1b2[0]
+    i1 = c.a1a2b1b2[1]
+    i2 = c.a1a2b1b2[2]
+    i3 = c.a1a2b1b2[3]
+    return ee_mollifier_threshold(soup.xcs[i0], soup.xcs[i1], soup.xcs[i2], soup.xcs[i3])
+
 @wp.func
 def project_spd_12(hess: mat12):
     # Cyclic Jacobi EVD, matching warp-ipc's numerical PSD projection.
@@ -668,10 +678,19 @@ def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         d02 = c.l0 * c.l0
         barrier_grad = ipc_barrier_derivative(d2, d02, contact_stiffness)
         barrier_hess = ipc_barrier_derivative2(d2, d02, contact_stiffness)
-        hess = barrier_hess * wp.outer(grad, grad) + barrier_grad * hess
+        eps_x = ee_mollifier_threshold_rest(soup, c)
+        mollifier, mollifier_grad, mollifier_hess = ee_mollifier_derivatives(
+            x0, x1, x2, x3, eps_x
+        )
+        barrier = ipc_barrier(d2, d02, contact_stiffness)
+        barrier_grad_vec = barrier_grad * grad
+        hess = mollifier * (barrier_hess * wp.outer(grad, grad) + barrier_grad * hess)
+        hess += barrier * mollifier_hess
+        hess += wp.outer(mollifier_grad, barrier_grad_vec)
+        hess += wp.outer(barrier_grad_vec, mollifier_grad)
         hess = project_spd_12(hess)
         # self.b stores force; compute_rhs later converts it to an energy gradient.
-        grad *= -barrier_grad
+        grad = -(mollifier * barrier_grad_vec + barrier * mollifier_grad)
 
         for ii in range(4):
             gii = vec3(grad[ii * 3 + 0], grad[ii * 3 + 1], grad[ii * 3 + 2])
@@ -769,7 +788,12 @@ def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype 
     dist, v0, v1 = fetch_dist_v0v1(states, soup, c)
     
     if dist < c.l0:
-        energy = ipc_barrier(dist * dist, c.l0 * c.l0, contact_stiffness)
+        eps_x = ee_mollifier_threshold_rest(soup, c)
+        mollifier = ee_mollifier_value(
+            soup.x_transformed[c.a1a2b1b2[0]], soup.x_transformed[c.a1a2b1b2[1]],
+            soup.x_transformed[c.a1a2b1b2[2]], soup.x_transformed[c.a1a2b1b2[3]], eps_x
+        )
+        energy = mollifier * ipc_barrier(dist * dist, c.l0 * c.l0, contact_stiffness)
         wp.atomic_add(e, 0, energy)
 
 @wp.kernel
