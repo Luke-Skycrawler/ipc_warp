@@ -74,7 +74,7 @@ def quadratic_bending(geo: FEMMesh, topo: EdgeTopoloby, triplets: Triplets, W: w
         kk = geo.T[t0, 0] + geo.T[t0, 1] + geo.T[t0, 2] - se
         ll = geo.T[t1, 0] + geo.T[t1, 1] + geo.T[t1, 2] - se
 
-    if t0 != -1 and t1 != -1 and not should_fix(geo.xcs[ii]) and not should_fix(geo.xcs[jj]) and not should_fix(geo.xcs[kk]) and not should_fix(geo.xcs[ll]):
+    if t0 != -1 and t1 != -1 and geo.fixed[ii] == 0 and geo.fixed[jj] == 0 and geo.fixed[kk] == 0 and geo.fixed[ll] == 0:
         # find the opposite vertices 
 
         x0 = geo.xcs[ii]
@@ -258,17 +258,11 @@ class BW98ThinShell(SifakisFEM):
 
         wp.launch(shell_kernel_sparse, (self.n_tets,), inputs = [self.xcs, self.geo, self.Bm, self.W, self.triplets, self.b]) 
     
-@wp.func 
-def should_fix(x: vec3): 
-    p1 = wp.abs(x[0] + 0.5) < eps and wp.abs(x[2] + 0.5) < eps
-    p2 = wp.abs(x[0] - 0.5) < eps and wp.abs(x[2] + 0.5) < eps
-    return p1 or p2 
-
 @wp.kernel
-def set_b_fixed(geo: FEMMesh,b: wp.array(dtype = vec3)):
+def set_b_fixed(geo: FEMMesh, b: wp.array(dtype = vec3)):
     i = wp.tid()
     # set fixed points rhs to 0
-    if should_fix(geo.xcs[i]): 
+    if geo.fixed[i] != 0:
         b[i] = vec3(0.0, 0.0, 0.0)
 
 @wp.kernel
@@ -277,7 +271,7 @@ def set_K_fixed(geo: FEMMesh, triplets: Triplets):
     i = triplets.rows[eij]
     j = triplets.cols[eij]
     
-    if should_fix(geo.xcs[i]) or should_fix(geo.xcs[j]):        
+    if geo.fixed[i] != 0 or geo.fixed[j] != 0:
         if i == j:
             triplets.vals[eij] = wp.identity(3, dtype = scalar)
         else:
@@ -302,6 +296,14 @@ class Shell(RodBCBase, BW98ThinShell, TOBJComplex):
         self.V = self.xcs.numpy()
         self.F = self.indices.numpy().reshape(-1, 3)
         self.define_bending_stiffness()
+
+    def set_fixed_boundary(self):
+        x = self.xcs.numpy()
+        fixed = (
+            (np.abs(x[:, 2] + 0.5) < eps)
+            & ((np.abs(x[:, 0] + 0.5) < eps) | (np.abs(x[:, 0] - 0.5) < eps))
+        )
+        self.geo.fixed.assign(fixed.astype(np.int32))
 
     def compute_K(self):
         self.triplets.vals.zero_()

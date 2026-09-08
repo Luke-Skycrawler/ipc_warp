@@ -21,8 +21,8 @@ quasi_static = False
 twist = True
 dirichlet_boundary = True
 attachment_stiffness = scalar(1e7)
-contact_stiffness = scalar(1e3)
-solver_choice = "ldlt"
+contact_stiffness = scalar(1e7)
+solver_choice = "cg"
 wp.config.max_unroll = 1
 wp.config.enable_backward = False
 
@@ -89,26 +89,15 @@ def compute_rhs(state: NewtonState, h: scalar, M: wp.array(dtype = scalar), b: w
 
 
 @wp.func
-def should_fix(x: vec3): 
-    ret = False
-    if wp.static(twist): 
-        ret = x[0] < -0.5 + eps or x[0] > 0.5 - eps
-    elif wp.static(dirichlet_boundary):
-        ret = x[0] < -0.5 + eps 
-    return ret
-
-    # v0 = vec3(-56.273449910216, 94.689259419722, -19.03583034376)
-    # return wp.length_sq(x - v0) < eps
-@wp.func
 def moving_boundary(x: vec3):
     return x[0] < -0.5 + eps# or x[0] > 0.5 - eps
     
 
 @wp.kernel
-def set_b_fixed(geo: FEMMesh,b: wp.array(dtype = vec3)):
+def set_b_fixed(geo: FEMMesh, b: wp.array(dtype = vec3)):
     i = wp.tid()
     # set fixed points rhs to 0
-    if should_fix(geo.xcs[i]): 
+    if geo.fixed[i] != 0:
         b[i] = vec3()
 
 @wp.kernel
@@ -121,7 +110,7 @@ def set_K_fixed(geo: FEMMesh, triplets: Triplets):
     i = geo.T[e, ii]
     j = geo.T[e, jj]
     
-    if should_fix(geo.xcs[i]) or should_fix(geo.xcs[j]):        
+    if geo.fixed[i] != 0 or geo.fixed[j] != 0:
         if ii == jj:
             triplets.vals[eij] += wp.identity(3, dtype = scalar) * attachment_stiffness
         # else:
@@ -157,7 +146,7 @@ def compute_Psi(x: wp.array(dtype = vec3), geo: FEMMesh, Bm: wp.array(dtype = ma
 def compute_inertia(geo: FEMMesh, state: NewtonState, M: wp.array(dtype = scalar), inert: wp.array(dtype = scalar), comp_x: wp.array(dtype = vec3), h: scalar):
     i = wp.tid()
     de = scalar(0.0)
-    if not should_fix(geo.xcs[i]):
+    if geo.fixed[i] == 0:
     # if True:
         dx = x_minus_tilde(state, h, i)
         de = wp.length_sq(dx) * M[i] * scalar(0.5)
@@ -167,7 +156,7 @@ def compute_inertia(geo: FEMMesh, state: NewtonState, M: wp.array(dtype = scalar
     wp.atomic_add(inert, 0, de)
 
 @wp.kernel
-def compute_compensation(state: NewtonState, geo: FEMMesh, theta: scalar, comp_x: wp.array(dtype = vec3)):
+def compute_twist_compensation(state: NewtonState, geo: FEMMesh, theta: scalar, comp_x: wp.array(dtype = vec3)):
     i = wp.tid()
     z = scalar(0.0)
     xi = state.x[i]
@@ -207,6 +196,7 @@ class RodBCBase:
         self.states.Psi = wp.zeros((self.n_tets,), dtype = scalar)
 
         self.comp_x = wp.zeros_like(self.states.dx)
+        self.set_fixed_boundary()
         
         self.reset()
         self.h = h
@@ -220,6 +210,22 @@ class RodBCBase:
 
         self.theta = 0.0
         self.frame = 0
+
+    def set_fixed_boundary(self):
+        """Initialize the per-node fixed mask once before simulation.
+
+        Override this method to assign a different ``int32[n_nodes]`` mask to
+        ``self.geo.fixed``.
+        Boundary selection remains host-side so changing it does not alter any
+        compiled Warp kernel.
+        """
+        x = self.xcs.numpy()
+        fixed = np.zeros(self.n_nodes, dtype=np.int32)
+        if twist:
+            fixed[(x[:, 0] < -0.5 + eps) | (x[:, 0] > 0.5 - eps)] = 1
+        elif dirichlet_boundary:
+            fixed[x[:, 0] < -0.5 + eps] = 1
+        self.geo.fixed.assign(fixed)
 
     def define_M(self):
         V = self.xcs.numpy()
@@ -291,15 +297,27 @@ class RodBCBase:
     def compute_rhs(self):
         wp.launch(compute_rhs, (self.n_nodes, ), inputs = [self.states, self.h, self.M, self.b])
         self.set_bc_fixed_grad()
-        if twist: 
-            self.comp_x.zero_()
-            wp.launch(compute_compensation, self.n_nodes, inputs= [self.states, self.geo, self.theta, self.comp_x])
-            # bsr_mv(self.A, self.comp_x, self.b, beta = 1.0)
-            print(f"compensation = {np.linalg.norm(self.comp_x.numpy())}")
+        self.compute_compensation()
 
-            tmp = bsr_mv(self.A, self.comp_x)
-            array_axpy(tmp, self.b, 1.0, 1.0)
-            wp.copy(self.comp_x, tmp)
+    def compute_compensation(self):
+        """Apply the prescribed-boundary displacement to the Newton RHS.
+
+        Override this hook for a different moving boundary. An override should
+        leave ``comp_x`` holding the compensation force used by the line-search
+        energy, as the default implementation does.
+        """
+        self.comp_x.zero_()
+        if not twist:
+            return
+        wp.launch(
+            compute_twist_compensation,
+            self.n_nodes,
+            inputs=[self.states, self.geo, self.theta, self.comp_x],
+        )
+        print(f"compensation = {np.linalg.norm(self.comp_x.numpy())}")
+        tmp = bsr_mv(self.A, self.comp_x)
+        array_axpy(tmp, self.b, 1.0, 1.0)
+        wp.copy(self.comp_x, tmp)
 
     def set_bc_fixed_grad(self):
         wp.launch(set_b_fixed, (self.n_nodes,), inputs = [self.geo, self.b])

@@ -478,7 +478,7 @@ class ContactSolverBase:
         n_edges = self.soup.edges.shape[0] // 2
         
         wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness])
-        self.n_contacts = self.contacts_new.cnt.numpy()[0]
+        self.n_contacts = min(int(self.contacts_new.cnt.numpy()[0]), contact_volume)
         print(f"n ee contacts = {self.n_contacts}")
         # print(self.contacts.list.numpy()["a1a2b1b2"][:self.n_contacts])
 
@@ -489,7 +489,7 @@ class ContactSolverBase:
             wp.launch(point_triangle_collision, n_pts, inputs = [self.tri_mesh.id, self.soup, self.contacts_pt, _thickness])
 
 
-            self.n_contacts_pt = self.contacts_pt.cnt.numpy()[0]
+            self.n_contacts_pt = min(int(self.contacts_pt.cnt.numpy()[0]), contact_volume)
             print(f"n pt contacts = {self.n_contacts_pt}")
 
     def get_contact_points(self):

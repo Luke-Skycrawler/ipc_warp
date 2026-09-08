@@ -35,6 +35,7 @@ class FEMMesh:
     n_nodes: int
     n_tets: int 
     xcs: wp.array(dtype = vec3)
+    fixed: wp.array(dtype = int)
     T: wp.array2d(dtype = int)
     indices: wp.array(dtype = int)
 

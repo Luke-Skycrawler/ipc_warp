@@ -216,6 +216,7 @@ class SifakisFEM:
         self.geo.n_nodes = self.n_nodes
         self.geo.n_tets = self.n_tets
         self.geo.xcs = self.xcs
+        self.geo.fixed = wp.zeros((self.n_nodes,), dtype=int, device=self.xcs.device)
         self.geo.T = self.T
         
         # use either
