@@ -21,8 +21,8 @@ quasi_static = False
 twist = True
 dirichlet_boundary = True
 attachment_stiffness = scalar(1e7)
-contact_stiffness = scalar(1e7)
-solver_choice = "cg"
+contact_stiffness = scalar(1e9)
+solver_choice = "ldlt"
 wp.config.max_unroll = 1
 wp.config.enable_backward = False
 
@@ -262,7 +262,7 @@ class RodBCBase:
 
             dxnp = self.states.dx.numpy()
             norm_dx = np.max(dxnp)
-            newton_iter = norm_dx > vel_tol * h and n_iter < max_iter
+            newton_iter = norm_dx > vel_tol * self.h and n_iter < max_iter
             print(f"norm = {np.linalg.norm(dxnp)}, {n_iter}")
             n_iter += 1
         self.update_x0_xdot()

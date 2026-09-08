@@ -316,7 +316,7 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
 
         collision_hess = bsr_from_triplets(self.n_nodes, self.n_nodes, triplets.rows, triplets.cols, triplets.vals)
 
-        bsr_axpy(collision_hess, self.K_sparse, h * h, 1.0)
+        bsr_axpy(collision_hess, self.K_sparse, self.h * self.h, 1.0)
 
     def compute_collision_energy(self):
         self.detect_collision()
