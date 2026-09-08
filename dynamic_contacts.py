@@ -302,28 +302,31 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         return self.collision_free_step(self.states.dx)
     
     def compute_A(self):
-        self.detect_collision()
-        super().compute_A()
-        
-        triplets = Triplets()
-        nnz = (self.n_contacts + self.n_contacts_pt) * 4 * 4
-        triplets.rows = wp.zeros((nnz,), dtype = int)
-        triplets.cols = wp.zeros_like(triplets.rows)
-        triplets.vals = wp.zeros((nnz,), dtype = mat33)
-        wp.launch(contact_hessian_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, triplets, self.b])
-        
-        wp.launch(contact_hessian_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, triplets, self.b, self.n_contacts])
+        with self.profile_timer("compute A"):
+            with self.profile_timer("detect collision"):
+                self.detect_collision()
+            with self.profile_timer("compute elastic hessian"):
+                super().compute_A()
+            with self.profile_timer("compute contact hessian"):
+                triplets = Triplets()
+                nnz = (self.n_contacts + self.n_contacts_pt) * 4 * 4
+                triplets.rows = wp.zeros((nnz,), dtype = int)
+                triplets.cols = wp.zeros_like(triplets.rows)
+                triplets.vals = wp.zeros((nnz,), dtype = mat33)
+                wp.launch(contact_hessian_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, triplets, self.b])
+                wp.launch(contact_hessian_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, triplets, self.b, self.n_contacts])
 
-        collision_hess = bsr_from_triplets(self.n_nodes, self.n_nodes, triplets.rows, triplets.cols, triplets.vals)
-
-        bsr_axpy(collision_hess, self.K_sparse, self.h * self.h, 1.0)
+                collision_hess = bsr_from_triplets(self.n_nodes, self.n_nodes, triplets.rows, triplets.cols, triplets.vals)
+                bsr_axpy(collision_hess, self.K_sparse, self.h * self.h, 1.0)
 
     def compute_collision_energy(self):
         self.detect_collision()
         e = wp.zeros((1,), dtype = scalar)
         wp.launch(contact_energy_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, e])
         wp.launch(contact_energy_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, e])
-        return e.numpy()[0] * self.h * self.h
+        with self.profile_timer("energy host transfer"):
+            energy_host = e.numpy()
+        return energy_host[0] * self.h * self.h
 
 @wp.kernel
 def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar)):

@@ -200,7 +200,26 @@ class RodBCBase:
         
         self.reset()
         self.h = h
+        self.profile_enabled = False
+        self.profile_print = True
+        self.profile_synchronize = True
+        self.profile_timings = {}
         print(f"timestep set to {h}")
+
+    def configure_profiling(self, enabled=True, print_timings=True, synchronize=True):
+        self.profile_enabled = enabled
+        self.profile_print = print_timings
+        self.profile_synchronize = synchronize
+        self.profile_timings = {}
+
+    def profile_timer(self, name):
+        return wp.ScopedTimer(
+            name,
+            active=self.profile_enabled,
+            print=self.profile_print,
+            dict=self.profile_timings,
+            synchronize=self.profile_synchronize,
+        )
         
     def reset(self):
         wp.copy(self.states.x, self.xcs)
@@ -248,23 +267,24 @@ class RodBCBase:
         max_iter = 100
         # while n_iter < max_iter:
         while newton_iter:
-            self.compute_A()
-            self.compute_rhs()
+            with self.profile_timer("total newton iteration"):
+                self.compute_A()
+                self.compute_rhs()
 
-            self.solve()
-            # wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, 1.0])
-            
-            
-            # line search stuff, not converged yet
-            alpha = self.line_search()
-            if alpha == 0.0:
-                break
+                self.solve()
+                # wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, 1.0])
 
-            dxnp = self.states.dx.numpy()
-            norm_dx = np.max(dxnp)
-            newton_iter = norm_dx > vel_tol * self.h and n_iter < max_iter
-            print(f"norm = {np.linalg.norm(dxnp)}, {n_iter}")
-            n_iter += 1
+                # line search stuff, not converged yet
+                alpha = self.line_search()
+                if alpha == 0.0:
+                    break
+
+                with self.profile_timer("dx host transfer"):
+                    dxnp = self.states.dx.numpy()
+                norm_dx = np.max(dxnp)
+                newton_iter = norm_dx > vel_tol * self.h and n_iter < max_iter
+                print(f"norm = {np.linalg.norm(dxnp)}, {n_iter}")
+                n_iter += 1
         self.update_x0_xdot()
         self.theta += self.h
         self.frame += 1
@@ -295,9 +315,10 @@ class RodBCBase:
         bsr_set_from_triplets(self.K_sparse, self.triplets.rows, self.triplets.cols, self.triplets.vals)        
         
     def compute_rhs(self):
-        wp.launch(compute_rhs, (self.n_nodes, ), inputs = [self.states, self.h, self.M, self.b])
-        self.set_bc_fixed_grad()
-        self.compute_compensation()
+        with self.profile_timer("compute rhs"):
+            wp.launch(compute_rhs, (self.n_nodes, ), inputs = [self.states, self.h, self.M, self.b])
+            self.set_bc_fixed_grad()
+            self.compute_compensation()
 
     def compute_compensation(self):
         """Apply the prescribed-boundary displacement to the Newton RHS.
@@ -326,7 +347,7 @@ class RodBCBase:
         wp.launch(set_K_fixed, (self.n_tets * 4 * 4,), inputs = [self.geo, self.triplets])
 
     def solve(self):
-        with wp.ScopedTimer("solve"):
+        with self.profile_timer("solve"):
             if solver_choice == "cg":
                 self.states.dx.zero_()
                 # bicgstab(self.A, self.b, self.states.dx, 1e-6, maxiter = 100)
@@ -366,28 +387,29 @@ class RodBCBase:
         return alpha
         
     def line_search(self):
-        # if twist: 
-        #     return self.line_search_fixed() 
-        # FIXME: not converged
-        x_tmp = wp.clone(self.states.x)
-        E0 = self.compute_psi() + self.compute_inertia() + self.compute_collision_energy()
-        upper_bound = self.line_search_upper_bound()
-        alpha = upper_bound
-        while True:
-            wp.copy(self.states.x, x_tmp)
-            wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, alpha])
-            E1 = self.compute_psi() + self.compute_inertia() + self.compute_collision_energy()
-            
-            if E1 < E0:
-                break
-            if alpha < 1e-2:
+        with self.profile_timer("line search"):
+            # if twist:
+            #     return self.line_search_fixed()
+            # FIXME: not converged
+            x_tmp = wp.clone(self.states.x)
+            E0 = self.compute_psi() + self.compute_inertia() + self.compute_collision_energy()
+            upper_bound = self.line_search_upper_bound()
+            alpha = upper_bound
+            while True:
                 wp.copy(self.states.x, x_tmp)
-                alpha = 0.0
-                break
-            alpha *= 0.5
+                wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, alpha])
+                E1 = self.compute_psi() + self.compute_inertia() + self.compute_collision_energy()
 
-        print(f"alpha = {alpha}, E0 = {E0}, E1 = {E1}, upper bound = {upper_bound}")
-        return alpha
+                if E1 < E0:
+                    break
+                if alpha < 1e-2:
+                    wp.copy(self.states.x, x_tmp)
+                    alpha = 0.0
+                    break
+                alpha *= 0.5
+
+            print(f"alpha = {alpha}, E0 = {E0}, E1 = {E1}, upper bound = {upper_bound}")
+            return alpha
 
     def line_search_upper_bound(self):
         return 1.0
@@ -399,12 +421,16 @@ class RodBCBase:
         h = self.h
         self.states.Psi.zero_()
         wp.launch(compute_Psi, (self.n_tets,), inputs = [self.states.x, self.geo, self.Bm, self.W, self.states.Psi])
-        return np.sum(self.states.Psi.numpy()) * h * h
+        with self.profile_timer("energy host transfer"):
+            psi_host = self.states.Psi.numpy()
+        return np.sum(psi_host) * h * h
     
     def compute_inertia(self):
         inert = wp.zeros((1,), dtype = scalar)
         wp.launch(compute_inertia, (self.n_nodes, ), inputs = [self.geo, self.states, self.M, inert, self.comp_x, self.h])
-        return inert.numpy()[0]
+        with self.profile_timer("energy host transfer"):
+            inert_host = inert.numpy()
+        return inert_host[0]
 
 class RodBC(RodBCBase, Rod):
     def __init__(self, h, filename = default_tobj):
