@@ -47,6 +47,10 @@ class PSViewer:
 
         if gui.Button("Save"):
             np.save(f"output/x_{self.frame}.npy", self.V)
+            if hasattr(self.rod, "save_checkpoint"):
+                self.rod.save_checkpoint(
+                    f"output/checkpoints/frame_{self.rod.frame:04d}.npz"
+                )
             print(f"output/x_{self.frame}.npy saved")
         if self.animate: 
             self.rod.step()

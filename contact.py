@@ -74,6 +74,7 @@ class Contacts:
     list: wp.array(dtype = ContactInfo)
     cnt: wp.array(dtype = int)
     htable: wp.array(dtype = int)
+    capacity: int
 
 @wp.struct 
 class ContactRet:
@@ -167,12 +168,12 @@ def _hash(a1: int, b1: int) -> int:
 @wp.func
 def append(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness: float):
     idx = wp.atomic_add(contacts.cnt, 0, 1)
-    h = _hash(a1, b1)
-    idx = idx % contact_volume
-    contacts.list[idx].a1a2b1b2 = wp.vec4i(a1, a2, b1, b2)
-    contacts.list[idx].l0 = scalar(thickness * 2.0)
-    contacts.list[idx].alpha = scalar(1e-6)
-    contacts.htable[h] = idx
+    if idx < contacts.capacity:
+        h = _hash(a1, b1)
+        contacts.list[idx].a1a2b1b2 = wp.vec4i(a1, a2, b1, b2)
+        contacts.list[idx].l0 = scalar(thickness * 2.0)
+        contacts.list[idx].alpha = scalar(1e-6)
+        contacts.htable[h] = idx
 
 @wp.kernel
 def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thickness: float):
@@ -202,7 +203,7 @@ def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thicknes
                 q2 = wp.vec3(soup.x_transformed[b2])
                 std = wp.closest_point_edge_edge(p1, p2, q1, q2, 1e-6)
                 dist = std[2]
-                if dist < (thickness + buffer) * 2.0:
+                if dist < thickness * 2.0:
                     append(contacts, a1, a2, b1, b2, thickness)
 @wp.func
 def closest_point_triangle(
@@ -308,7 +309,7 @@ def point_triangle_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thi
                 std, _ = closest_point_triangle(xi, q1, q2, q3)
 
                 dist = std[2]
-                if dist < (thickness + buffer) * 2.0:
+                if dist < thickness * 2.0:
                     append(contacts, i, t2, t1, t3, thickness)
 
 @wp.func 
@@ -395,6 +396,7 @@ class ContactSolverBase:
         self.contacts_new.list = self.contacts_list_new
         self.contacts_new.cnt = self.contacts_cnt_new
         self.contacts_new.htable = self.contacts_htable_new
+        self.contacts_new.capacity = contact_volume
 
         self.n_contacts = 0
         self.n_contacts_pt = 0
@@ -412,8 +414,25 @@ class ContactSolverBase:
         self.contacts_pt.list = self.contacts_list_pt
         self.contacts_pt.cnt = self.contacts_cnt_pt
         self.contacts_pt.htable = self.contacts_htable_pt
+        self.contacts_pt.capacity = contact_volume
 
         self.n_contacts_pt = 0
+
+    def _grow_contact_list(self, contacts, required, point_triangle=False):
+        """Grow a GPU contact list after an overflowed counting pass."""
+        capacity = 1 << (required - 1).bit_length()
+        storage = wp.zeros((capacity,), dtype=ContactInfo)
+        contacts.list = storage
+        contacts.capacity = capacity
+        if point_triangle:
+            self.contacts_list_pt = storage
+        else:
+            self.contacts_list_new = storage
+
+        if self.contact_ret.points.shape[0] < capacity:
+            self.contact_ret.points = wp.zeros((capacity,), dtype=vec3)
+            self.contact_ret.dists = wp.zeros((capacity,), dtype=scalar)
+        print(f"contact buffer grown to {capacity}")
 
     def collision_free_step(self, dx):
         """Return a zero-thickness CCD upper bound for the solver update x -= alpha * dx."""
@@ -481,7 +500,13 @@ class ContactSolverBase:
         
         wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness])
         with self.profile_timer("contact count host transfer"):
-            self.n_contacts = min(int(self.contacts_new.cnt.numpy()[0]), contact_volume)
+            self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
+        if self.n_contacts > self.contacts_new.capacity:
+            self._grow_contact_list(self.contacts_new, self.n_contacts)
+            self.contacts_new.cnt.zero_()
+            wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness])
+            with self.profile_timer("contact count host transfer"):
+                self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
         if verbose:
             print(f"n ee contacts = {self.n_contacts}")
         # print(self.contacts.list.numpy()["a1a2b1b2"][:self.n_contacts])
@@ -494,7 +519,13 @@ class ContactSolverBase:
 
 
             with self.profile_timer("contact count host transfer"):
-                self.n_contacts_pt = min(int(self.contacts_pt.cnt.numpy()[0]), contact_volume)
+                self.n_contacts_pt = int(self.contacts_pt.cnt.numpy()[0])
+            if self.n_contacts_pt > self.contacts_pt.capacity:
+                self._grow_contact_list(self.contacts_pt, self.n_contacts_pt, point_triangle=True)
+                self.contacts_pt.cnt.zero_()
+                wp.launch(point_triangle_collision, n_pts, inputs = [self.tri_mesh.id, self.soup, self.contacts_pt, _thickness])
+                with self.profile_timer("contact count host transfer"):
+                    self.n_contacts_pt = int(self.contacts_pt.cnt.numpy()[0])
             if verbose:
                 print(f"n pt contacts = {self.n_contacts_pt}")
 

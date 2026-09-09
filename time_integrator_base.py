@@ -1,6 +1,7 @@
 import numpy as np
 import igl
 import warp as wp
+from pathlib import Path
 from fem.interface import Rod, default_tobj
 from fem.params import NewtonState, FEMMesh, gravity, gravity_np
 from fem.fem import tet_kernel, tet_kernel_sparse, Triplets, psi
@@ -254,6 +255,61 @@ class RodBCBase:
 
         self.theta = 0.0
         self.frame = 0
+
+    def save_checkpoint(self, filename):
+        """Store the complete time-integration state needed to rerun a frame."""
+        path = Path(filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            path,
+            x=self.states.x.numpy(),
+            x0=self.states.x0.numpy(),
+            xdot=self.states.xdot.numpy(),
+            theta=np.asarray(self.theta, dtype=np.float64),
+            frame=np.asarray(self.frame, dtype=np.int64),
+            timestep=np.asarray(self.h, dtype=np.float64),
+            n_nodes=np.asarray(self.n_nodes, dtype=np.int64),
+            n_tets=np.asarray(self.n_tets, dtype=np.int64),
+            rest_sum=np.asarray(np.sum(self.xcs.numpy()), dtype=np.float64),
+        )
+        print(f"checkpoint saved: {path}")
+
+    def load_checkpoint(self, filename):
+        """Restore a checkpoint; contacts and matrices are rebuilt on demand."""
+        path = Path(filename)
+        with np.load(path, allow_pickle=False) as data:
+            x = np.asarray(data["x"])
+            x0 = np.asarray(data["x0"])
+            xdot = np.asarray(data["xdot"])
+            expected_shape = (self.n_nodes, 3)
+            if x.shape != expected_shape or x0.shape != expected_shape or xdot.shape != expected_shape:
+                raise ValueError(
+                    f"Checkpoint state shape does not match this mesh: "
+                    f"{x.shape}, expected {expected_shape}"
+                )
+            if int(data["n_tets"]) != self.n_tets:
+                raise ValueError("Checkpoint tetrahedron count does not match this mesh")
+            if not np.isclose(float(data["timestep"]), self.h):
+                raise ValueError("Checkpoint timestep does not match this simulation")
+            if not np.isclose(float(data["rest_sum"]), np.sum(self.xcs.numpy())):
+                raise ValueError("Checkpoint rest geometry does not match this simulation")
+            if not (np.all(np.isfinite(x)) and np.all(np.isfinite(x0)) and np.all(np.isfinite(xdot))):
+                raise ValueError("Checkpoint contains a non-finite state")
+
+            self.states.x.assign(x)
+            self.states.x0.assign(x0)
+            self.states.xdot.assign(xdot)
+            self.states.dx.zero_()
+            self.states.Psi.zero_()
+            self.theta = float(data["theta"])
+            self.frame = int(data["frame"])
+
+        self.on_checkpoint_loaded()
+        print(f"checkpoint loaded: {path} (frame {self.frame})")
+
+    def on_checkpoint_loaded(self):
+        """Hook for invalidating state-dependent caches after a restore."""
+        pass
 
     def set_fixed_boundary(self):
         """Initialize the per-node fixed mask once before simulation.

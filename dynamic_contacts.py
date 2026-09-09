@@ -307,6 +307,12 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         self.ldlt_symbolic_factorizations = 0
         self.ldlt_refactorizations = 0
 
+    def on_checkpoint_loaded(self):
+        # The restored geometry may have a different active contact pattern.
+        # Force one fresh symbolic analysis; subsequent Newton iterations can
+        # resume the normal collision-pattern reuse path.
+        self._ldlt_collision_pattern = None
+
     def line_search_upper_bound(self):
         return self.collision_free_step(self.states.dx)
     

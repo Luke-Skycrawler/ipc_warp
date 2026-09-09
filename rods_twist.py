@@ -37,7 +37,7 @@ ROD_OFFSETS = (
 )
 TWIST_ANGULAR_SPEED = 0.4 * np.pi
 END_CAP_TOLERANCE = 1.0e-5
-CONTACT_THICKNESS = 2.0e-3
+CONTACT_THICKNESS = 1.0e-3
 
 
 def orient_boundary(vertices, tetrahedra):
@@ -161,11 +161,60 @@ def main():
         action="store_true",
         help="Use rod.msh instead of the paper's rod300x33.msh.",
     )
+    parser.add_argument(
+        "--load-checkpoint",
+        type=Path,
+        help="Restore a state saved by a previous run before starting.",
+    )
+    parser.add_argument(
+        "--save-checkpoint",
+        type=Path,
+        help="Save the final state (also works after zero headless steps).",
+    )
+    parser.add_argument(
+        "--headless-steps",
+        type=int,
+        help="Run this many additional steps without opening Polyscope.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="During a headless run, save every N completed frames (0 disables).",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=Path("output/checkpoints/rods_twist"),
+        help="Directory used by --checkpoint-every.",
+    )
     args = parser.parse_args()
 
+    if args.headless_steps is not None and args.headless_steps < 0:
+        parser.error("--headless-steps must be non-negative")
+    if args.checkpoint_every < 0:
+        parser.error("--checkpoint-every must be non-negative")
+
     wp.init()
-    ps.init()
     simulation = RodsTwist(high_resolution=not args.low_resolution)
+    if args.load_checkpoint is not None:
+        simulation.load_checkpoint(args.load_checkpoint)
+
+    if args.headless_steps is not None:
+        for _ in range(args.headless_steps):
+            simulation.step()
+            if (
+                args.checkpoint_every > 0
+                and simulation.frame % args.checkpoint_every == 0
+            ):
+                simulation.save_checkpoint(
+                    args.checkpoint_dir / f"frame_{simulation.frame:04d}.npz"
+                )
+        if args.save_checkpoint is not None:
+            simulation.save_checkpoint(args.save_checkpoint)
+        return
+
+    ps.init()
     viewer = PSViewer(simulation)
 
     handles = ps.register_point_cloud(
