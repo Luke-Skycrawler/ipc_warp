@@ -17,6 +17,7 @@ eps = 1e-6
 FLT_MAX = 1e5
 ZERO = 1e-6
 disable_self_collision = False
+verbose = False
 
 '''
 TODO: make sure max_unroll = 0 before importing this module
@@ -481,7 +482,8 @@ class ContactSolverBase:
         wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness])
         with self.profile_timer("contact count host transfer"):
             self.n_contacts = min(int(self.contacts_new.cnt.numpy()[0]), contact_volume)
-        print(f"n ee contacts = {self.n_contacts}")
+        if verbose:
+            print(f"n ee contacts = {self.n_contacts}")
         # print(self.contacts.list.numpy()["a1a2b1b2"][:self.n_contacts])
 
         self.contacts_pt.cnt.zero_()
@@ -493,7 +495,8 @@ class ContactSolverBase:
 
             with self.profile_timer("contact count host transfer"):
                 self.n_contacts_pt = min(int(self.contacts_pt.cnt.numpy()[0]), contact_volume)
-            print(f"n pt contacts = {self.n_contacts_pt}")
+            if verbose:
+                print(f"n pt contacts = {self.n_contacts_pt}")
 
     def get_contact_points(self):
         wp.launch(get_contact_points, (self.n_contacts,), inputs = [self.history, self.soup, self.contacts_new.list, self.contact_ret])

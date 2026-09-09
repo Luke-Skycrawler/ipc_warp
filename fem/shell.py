@@ -258,34 +258,6 @@ class BW98ThinShell(SifakisFEM):
 
         wp.launch(shell_kernel_sparse, (self.n_tets,), inputs = [self.xcs, self.geo, self.Bm, self.W, self.triplets, self.b]) 
     
-@wp.kernel
-def set_b_fixed(geo: FEMMesh, b: wp.array(dtype = vec3)):
-    i = wp.tid()
-    # set fixed points rhs to 0
-    if geo.fixed[i] != 0:
-        b[i] = vec3(0.0, 0.0, 0.0)
-
-@wp.kernel
-def set_K_fixed(geo: FEMMesh, triplets: Triplets):
-    eij = wp.tid()
-    i = triplets.rows[eij]
-    j = triplets.cols[eij]
-    
-    if geo.fixed[i] != 0 or geo.fixed[j] != 0:
-        if i == j:
-            triplets.vals[eij] = wp.identity(3, dtype = scalar)
-        else:
-            triplets.vals[eij] = mat33(0.0)
-
-# @wp.kernel
-# def set_Q_fixed(geo: FEMMesh, triplets: Triplets):
-#     eij = wp.tid()
-#     i = triplets.rows[eij]
-#     j = triplets.cols[eij]
-    
-#     if should_fix(geo.xcs[i]) or should_fix(geo.xcs[j]):        
-#         triplets.vals[eij] = mat33(0.0)
-
 class Shell(RodBCBase, BW98ThinShell, TOBJComplex):
     def __init__(self, h, meshes_filename = [default_shell], transforms = [np.identity(4, dtype = scalar)]): 
         self.meshes_filename = meshes_filename
@@ -311,14 +283,10 @@ class Shell(RodBCBase, BW98ThinShell, TOBJComplex):
         wp.launch(shell_kernel_sparse, (self.n_tets,), inputs = [self.states.x, self.geo, self.Bm, self.W, self.triplets, self.b]) 
         # now self.b has the elastic forces
 
-        self.set_bc_fixed_hessian()
         bsr_set_zero(self.K_sparse)
         bsr_set_from_triplets(self.K_sparse, self.triplets.rows, self.triplets.cols, self.triplets.vals) 
         bsr_axpy(self.Q, self.K_sparse, kb, beta = 1.0)       
     
-    def set_bc_fixed_hessian(self):
-        wp.launch(set_K_fixed, (self.n_tets * 3 * 3,), inputs = [self.geo, self.triplets])
-
     def compute_K_fd(self):
         # wp.launch(shell_kernel_sparse, (self.n_tets,), inputs = [self.xcs, self.geo, self.Bm, self.W, self.triplets, self.b]) 
         # b0 = self.b.numpy().copy()
@@ -340,7 +308,8 @@ class Shell(RodBCBase, BW98ThinShell, TOBJComplex):
         return -K_fd / (h_fd * 2.)
     
     def set_bc_fixed_grad(self): 
-        wp.launch(set_b_fixed, (self.n_nodes,), inputs = [self.geo, self.b])
+        # Fixed vertices are handled by RodBCBase.attachment_matrix.
+        pass
 
     def define_bending_stiffness(self):
         F = self.T.numpy()

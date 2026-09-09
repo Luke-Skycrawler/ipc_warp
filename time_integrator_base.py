@@ -20,7 +20,7 @@ boundary_v = 1.0
 quasi_static = False
 twist = True
 dirichlet_boundary = True
-attachment_stiffness = scalar(1e7)
+attachment_stiffness = scalar(1e11)
 contact_stiffness = scalar(1e9)
 solver_choice = "ldlt"
 wp.config.max_unroll = 1
@@ -94,27 +94,18 @@ def moving_boundary(x: vec3):
     
 
 @wp.kernel
-def set_b_fixed(geo: FEMMesh, b: wp.array(dtype = vec3)):
+def initialize_attachment_triplets(
+    geo: FEMMesh,
+    triplets: Triplets,
+    stiffness: scalar,
+):
     i = wp.tid()
-    # set fixed points rhs to 0
+    triplets.rows[i] = i
+    triplets.cols[i] = i
     if geo.fixed[i] != 0:
-        b[i] = vec3()
-
-@wp.kernel
-def set_K_fixed(geo: FEMMesh, triplets: Triplets):
-    eij = wp.tid()
-    e = eij // 16
-    ii = (eij // 4) % 4
-    jj = eij % 4
-
-    i = geo.T[e, ii]
-    j = geo.T[e, jj]
-    
-    if geo.fixed[i] != 0 or geo.fixed[j] != 0:
-        if ii == jj:
-            triplets.vals[eij] += wp.identity(3, dtype = scalar) * attachment_stiffness
-        # else:
-        #     triplets.vals[eij] = mat33(0.0)
+        triplets.vals[i] = wp.identity(3, dtype=scalar) * stiffness
+    else:
+        triplets.vals[i] = mat33(scalar(0.0))
 
 @wp.kernel
 def add_dx(state: NewtonState, alpha :scalar):
@@ -143,17 +134,34 @@ def compute_Psi(x: wp.array(dtype = vec3), geo: FEMMesh, Bm: wp.array(dtype = ma
     Psi[e] = W[e] * psie
 
 @wp.kernel
-def compute_inertia(geo: FEMMesh, state: NewtonState, M: wp.array(dtype = scalar), inert: wp.array(dtype = scalar), comp_x: wp.array(dtype = vec3), h: scalar):
+def compute_inertia(geo: FEMMesh, state: NewtonState, M: wp.array(dtype = scalar), inert: wp.array(dtype = scalar), h: scalar):
     i = wp.tid()
     de = scalar(0.0)
     if geo.fixed[i] == 0:
-    # if True:
         dx = x_minus_tilde(state, h, i)
         de = wp.length_sq(dx) * M[i] * scalar(0.5)
-        # de = wp.dot(comp_x[i], state.x[i])
-    else: 
-        de = wp.dot(comp_x[i], state.x[i])
     wp.atomic_add(inert, 0, de)
+
+
+@wp.kernel
+def subtract_gradient(
+    gradient: wp.array(dtype=vec3),
+    base_gradient: wp.array(dtype=vec3),
+    correction: wp.array(dtype=vec3),
+):
+    i = wp.tid()
+    correction[i] = gradient[i] - base_gradient[i]
+
+
+@wp.kernel
+def compute_linearized_bc_energy(
+    state: NewtonState,
+    reference_x: wp.array(dtype=vec3),
+    correction: wp.array(dtype=vec3),
+    energy: wp.array(dtype=scalar),
+):
+    i = wp.tid()
+    wp.atomic_add(energy, 0, wp.dot(correction[i], state.x[i] - reference_x[i]))
 
 @wp.kernel
 def compute_twist_compensation(state: NewtonState, geo: FEMMesh, theta: scalar, comp_x: wp.array(dtype = vec3)):
@@ -187,6 +195,7 @@ class RodBCBase:
 
     def  __init__(self, h):
         super().__init__()
+        self.h = h
         self.define_M()
         self.states = NewtonState()
         self.states.x = wp.zeros_like(self.xcs)
@@ -196,10 +205,15 @@ class RodBCBase:
         self.states.Psi = wp.zeros((self.n_tets,), dtype = scalar)
 
         self.comp_x = wp.zeros_like(self.states.dx)
+        # Boundary compensation changes the assembled gradient without being a
+        # conservative physical energy.  Store that change explicitly so the
+        # line-search model has the same directional derivative as the solve.
+        self.energy_gradient_correction = wp.zeros_like(self.states.dx)
+        self.line_search_reference_x = wp.zeros_like(self.states.x)
         self.set_fixed_boundary()
+        self.initialize_attachment_matrix()
         
         self.reset()
-        self.h = h
         self.profile_enabled = False
         self.profile_print = True
         self.profile_synchronize = True
@@ -260,13 +274,38 @@ class RodBCBase:
         wp.launch(set_M_diag, (self.n_nodes,), inputs = [self.M, M_diag])
         bsr_set_diag(self.M_sparse, M_diag)
 
+    def initialize_attachment_matrix(self):
+        """Build the fixed-node diagonal matrix once after the mask is set."""
+        self.attachment_triplets = Triplets()
+        self.attachment_triplets.rows = wp.zeros(self.n_nodes, dtype=int)
+        self.attachment_triplets.cols = wp.zeros(self.n_nodes, dtype=int)
+        self.attachment_triplets.vals = wp.zeros(self.n_nodes, dtype=mat33)
+
+        # Previously the attachment was part of K and therefore received the
+        # same h^2 scaling as the elastic Hessian in dynamic mode.
+        scale = attachment_stiffness
+        if not quasi_static:
+            scale *= scalar(self.h * self.h)
+        wp.launch(
+            initialize_attachment_triplets,
+            self.n_nodes,
+            inputs=[self.geo, self.attachment_triplets, scale],
+        )
+        self.attachment_matrix = bsr_from_triplets(
+            self.n_nodes,
+            self.n_nodes,
+            self.attachment_triplets.rows,
+            self.attachment_triplets.cols,
+            self.attachment_triplets.vals,
+        )
+
 
     def step(self):
         newton_iter = True
         n_iter = 0
         max_iter = 100
         # while n_iter < max_iter:
-        while newton_iter:
+        while newton_iter and n_iter < max_iter:
             with self.profile_timer("total newton iteration"):
                 self.compute_A()
                 self.compute_rhs()
@@ -281,9 +320,9 @@ class RodBCBase:
 
                 with self.profile_timer("dx host transfer"):
                     dxnp = self.states.dx.numpy()
-                norm_dx = np.max(dxnp)
-                newton_iter = norm_dx > vel_tol * self.h and n_iter < max_iter
-                print(f"norm = {np.linalg.norm(dxnp)}, {n_iter}")
+                norm_dx = np.max(np.abs(dxnp))
+                newton_iter = norm_dx > vel_tol * self.h
+                print(f"    norm = {norm_dx:1.2e}, iter = {n_iter}")
                 n_iter += 1
         self.update_x0_xdot()
         self.theta += self.h
@@ -302,6 +341,7 @@ class RodBCBase:
             bsr_axpy(self.M_sparse, self.K_sparse, 1.0, h * h)
 
         self.A = self.K_sparse
+        bsr_axpy(self.attachment_matrix, self.A, 1.0, 1.0)
         # self.A = self.M_sparse 
 
     def compute_K(self):
@@ -310,15 +350,20 @@ class RodBCBase:
         wp.launch(tet_kernel_sparse, (self.n_tets * 4 * 4,), inputs = [self.states.x, self.geo, self.Bm, self.W, self.triplets, self.b]) 
         # now self.b has the elastic forces
 
-        self.set_bc_fixed_hessian()
         bsr_set_zero(self.K_sparse)
         bsr_set_from_triplets(self.K_sparse, self.triplets.rows, self.triplets.cols, self.triplets.vals)        
         
     def compute_rhs(self):
         with self.profile_timer("compute rhs"):
             wp.launch(compute_rhs, (self.n_nodes, ), inputs = [self.states, self.h, self.M, self.b])
+            wp.copy(self.energy_gradient_correction, self.b)
             self.set_bc_fixed_grad()
             self.compute_compensation()
+            wp.launch(
+                subtract_gradient,
+                self.n_nodes,
+                inputs=[self.b, self.energy_gradient_correction, self.energy_gradient_correction],
+            )
 
     def compute_compensation(self):
         """Apply the prescribed-boundary displacement to the Newton RHS.
@@ -335,23 +380,22 @@ class RodBCBase:
             self.n_nodes,
             inputs=[self.states, self.geo, self.theta, self.comp_x],
         )
-        print(f"compensation = {np.linalg.norm(self.comp_x.numpy())}")
+        # print(f"    compensation = {np.linalg.norm(self.comp_x.numpy())}")
         tmp = bsr_mv(self.A, self.comp_x)
         array_axpy(tmp, self.b, 1.0, 1.0)
         wp.copy(self.comp_x, tmp)
 
     def set_bc_fixed_grad(self):
-        wp.launch(set_b_fixed, (self.n_nodes,), inputs = [self.geo, self.b])
+        # The new attachment formulation is a penalty, not hard elimination:
+        # retain the physical gradient and add A(x - x_target) below.
+        pass
     
-    def set_bc_fixed_hessian(self):
-        wp.launch(set_K_fixed, (self.n_tets * 4 * 4,), inputs = [self.geo, self.triplets])
-
     def solve(self):
         with self.profile_timer("solve"):
             if solver_choice == "cg":
                 self.states.dx.zero_()
                 # bicgstab(self.A, self.b, self.states.dx, 1e-6, maxiter = 100)
-                cg(self.A, self.b, self.states.dx, 1e-6, use_cuda_graph = True)
+                cg(self.A, self.b, self.states.dx, 1e-4, use_cuda_graph = True)
             elif solver_choice == "ldlt":
                 n = self.A.shape[0]
                 block_nnz = self.A.nnz_sync()
@@ -392,23 +436,35 @@ class RodBCBase:
             #     return self.line_search_fixed()
             # FIXME: not converged
             x_tmp = wp.clone(self.states.x)
+            wp.copy(self.line_search_reference_x, x_tmp)
             E0 = self.compute_psi() + self.compute_inertia() + self.compute_collision_energy()
+            E0 += self.compute_bc_energy()
             upper_bound = self.line_search_upper_bound()
             alpha = upper_bound
-            while True:
+            E1 = np.inf
+            accepted = False
+            # A contact barrier can make the useful step many orders of
+            # magnitude smaller than the CCD upper bound.  A fixed 1e-2
+            # cutoff incorrectly rejects valid descent directions precisely
+            # when contact becomes stiff.
+            for _ in range(64):
                 wp.copy(self.states.x, x_tmp)
                 wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, alpha])
                 E1 = self.compute_psi() + self.compute_inertia() + self.compute_collision_energy()
+                E1 += self.compute_bc_energy()
 
-                if E1 < E0:
-                    break
-                if alpha < 1e-2:
-                    wp.copy(self.states.x, x_tmp)
-                    alpha = 0.0
+                if np.isfinite(E1) and E1 < E0:
+                    accepted = True
                     break
                 alpha *= 0.5
+                if alpha <= np.finfo(np.float64).eps * max(1.0, upper_bound):
+                    break
 
-            print(f"alpha = {alpha}, E0 = {E0}, E1 = {E1}, upper bound = {upper_bound}")
+            if not accepted:
+                wp.copy(self.states.x, x_tmp)
+                alpha = 0.0
+
+            print(f"    alpha = {alpha:1.2e}, E0 = {E0:1.2e}, E1 = {E1:1.2e}, upper bound = {upper_bound:1.2e}")
             return alpha
 
     def line_search_upper_bound(self):
@@ -427,10 +483,32 @@ class RodBCBase:
     
     def compute_inertia(self):
         inert = wp.zeros((1,), dtype = scalar)
-        wp.launch(compute_inertia, (self.n_nodes, ), inputs = [self.geo, self.states, self.M, inert, self.comp_x, self.h])
+        wp.launch(compute_inertia, (self.n_nodes, ), inputs = [self.geo, self.states, self.M, inert, self.h])
         with self.profile_timer("energy host transfer"):
             inert_host = inert.numpy()
         return inert_host[0]
+
+    def compute_bc_energy(self):
+        """Linearized energy whose gradient is the current BC correction.
+
+        Measuring from the current line-search position avoids the very large
+        constant offsets that previously caused catastrophic cancellation in
+        the E1 < E0 comparison.
+        """
+        energy = wp.zeros((1,), dtype=scalar)
+        wp.launch(
+            compute_linearized_bc_energy,
+            self.n_nodes,
+            inputs=[
+                self.states,
+                self.line_search_reference_x,
+                self.energy_gradient_correction,
+                energy,
+            ],
+        )
+        with self.profile_timer("energy host transfer"):
+            energy_host = energy.numpy()
+        return energy_host[0]
 
 class RodBC(RodBCBase, Rod):
     def __init__(self, h, filename = default_tobj):
