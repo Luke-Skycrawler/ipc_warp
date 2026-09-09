@@ -37,7 +37,7 @@ ROD_OFFSETS = (
 )
 TWIST_ANGULAR_SPEED = 0.4 * np.pi
 END_CAP_TOLERANCE = 1.0e-5
-CONTACT_THICKNESS = 2.0e-4
+CONTACT_THICKNESS = 2.0e-3
 
 
 def orient_boundary(vertices, tetrahedra):
@@ -136,7 +136,7 @@ class RodsTwist(RodComplexBC):
         )
 
     def compute_compensation(self):
-        self.comp_x.zero_()
+        self.attachment_residual.zero_()
         wp.launch(
             set_twist_displacement,
             self.n_nodes,
@@ -146,10 +146,10 @@ class RodsTwist(RodComplexBC):
                 self.theta + self.h,
                 TWIST_ANGULAR_SPEED,
                 vec3(*self.scene_center),
-                self.comp_x,
+                self.attachment_residual,
             ],
         )
-        tmp = bsr_mv(self.A, self.comp_x)
+        tmp = bsr_mv(self.attachment_matrix, self.attachment_residual)
         array_axpy(tmp, self.b, 1.0, 1.0)
         wp.copy(self.comp_x, tmp)
 
