@@ -406,7 +406,37 @@ class RodBCBase:
         # The new attachment formulation is a penalty, not hard elimination:
         # retain the physical gradient and add A(x - x_target) below.
         pass
-    
+
+    def solve_ldlt(self): 
+        n = self.A.shape[0]
+        block_nnz = self.A.nnz_sync()
+        scalar_nnz = block_nnz * 9
+        offsets = wp.empty(n + 1, dtype=int, device=self.A.device)
+        columns = wp.empty(scalar_nnz, dtype=int, device=self.A.device)
+        values = wp.empty(scalar_nnz, dtype=scalar, device=self.A.device)
+
+        wp.launch(
+            bsr_to_scalar_csr,
+            dim=n + 1,
+            inputs=[
+                self.A.offsets,
+                self.A.columns,
+                self.A.values,
+                offsets,
+                columns,
+                values,
+                self.A.nrow,
+            ],
+            device=self.A.device,
+        )
+
+        direct_solver = CUSolverDevice(
+            offsets.ptr, columns.ptr, values.ptr, n, scalar_nnz
+        )
+        direct_solver.analyze_pattern()
+        direct_solver.factorize()
+        direct_solver.solve(self.b.ptr, self.states.dx.ptr)
+
     def solve(self):
         with self.profile_timer("solve"):
             if solver_choice == "cg":
@@ -414,34 +444,8 @@ class RodBCBase:
                 # bicgstab(self.A, self.b, self.states.dx, 1e-6, maxiter = 100)
                 cg(self.A, self.b, self.states.dx, 1e-4, use_cuda_graph = True)
             elif solver_choice == "ldlt":
-                n = self.A.shape[0]
-                block_nnz = self.A.nnz_sync()
-                scalar_nnz = block_nnz * 9
-                offsets = wp.empty(n + 1, dtype=int, device=self.A.device)
-                columns = wp.empty(scalar_nnz, dtype=int, device=self.A.device)
-                values = wp.empty(scalar_nnz, dtype=scalar, device=self.A.device)
+                self.solve_ldlt()
 
-                wp.launch(
-                    bsr_to_scalar_csr,
-                    dim=n + 1,
-                    inputs=[
-                        self.A.offsets,
-                        self.A.columns,
-                        self.A.values,
-                        offsets,
-                        columns,
-                        values,
-                        self.A.nrow,
-                    ],
-                    device=self.A.device,
-                )
-
-                direct_solver = CUSolverDevice(
-                    offsets.ptr, columns.ptr, values.ptr, n, scalar_nnz
-                )
-                direct_solver.analyze_pattern()
-                direct_solver.factorize()
-                direct_solver.solve(self.b.ptr, self.states.dx.ptr)
     def line_search_fixed(self):
         alpha = self.line_search_upper_bound()
         wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, alpha])

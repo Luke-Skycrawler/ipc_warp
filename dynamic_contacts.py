@@ -1,3 +1,4 @@
+import numpy as np
 import warp as wp
 from fem.interface import RodComplex
 from geometry.static_scene import StaticScene
@@ -297,6 +298,14 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         RodBCBase.__init__(self, h)
         self.soup.x_transformed = self.states.x
         ContactSolverBase.__init__(self)
+        self._ldlt_solver = None
+        self._ldlt_collision_pattern = None
+        self._ldlt_offsets = None
+        self._ldlt_columns = None
+        self._ldlt_values = None
+        self._ldlt_scalar_nnz = 0
+        self.ldlt_symbolic_factorizations = 0
+        self.ldlt_refactorizations = 0
 
     def line_search_upper_bound(self):
         return self.collision_free_step(self.states.dx)
@@ -308,16 +317,22 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
             with self.profile_timer("compute elastic hessian"):
                 super().compute_A()
             with self.profile_timer("compute contact hessian"):
-                triplets = Triplets()
+                self.collision_triplets = Triplets()
                 nnz = (self.n_contacts + self.n_contacts_pt) * 4 * 4
-                triplets.rows = wp.zeros((nnz,), dtype = int)
-                triplets.cols = wp.zeros_like(triplets.rows)
-                triplets.vals = wp.zeros((nnz,), dtype = mat33)
-                wp.launch(contact_hessian_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, triplets, self.b])
-                wp.launch(contact_hessian_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, triplets, self.b, self.n_contacts])
+                self.collision_triplets.rows = wp.zeros((nnz,), dtype = int)
+                self.collision_triplets.cols = wp.zeros_like(self.collision_triplets.rows)
+                self.collision_triplets.vals = wp.zeros((nnz,), dtype = mat33)
+                wp.launch(contact_hessian_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, self.collision_triplets, self.b])
+                wp.launch(contact_hessian_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, self.collision_triplets, self.b, self.n_contacts])
 
-                collision_hess = bsr_from_triplets(self.n_nodes, self.n_nodes, triplets.rows, triplets.cols, triplets.vals)
-                bsr_axpy(collision_hess, self.K_sparse, self.h * self.h, 1.0)
+                self.collision_hessian = bsr_from_triplets(
+                    self.n_nodes,
+                    self.n_nodes,
+                    self.collision_triplets.rows,
+                    self.collision_triplets.cols,
+                    self.collision_triplets.vals,
+                )
+                bsr_axpy(self.collision_hessian, self.K_sparse, self.h * self.h, 1.0)
 
     def compute_collision_energy(self):
         self.detect_collision()
@@ -327,6 +342,70 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         with self.profile_timer("energy host transfer"):
             energy_host = e.numpy()
         return energy_host[0] * self.h * self.h
+
+    def solve_ldlt(self):
+        # bsr_from_triplets canonicalizes the contact triplets, so this pattern
+        # comparison is insensitive to the atomic order used to discover the
+        # same contact set.
+        with self.profile_timer("collision pattern host transfer"):
+            collision_nnz = self.collision_hessian.nnz_sync()
+            collision_offsets = self.collision_hessian.offsets.numpy().copy()
+            collision_columns = self.collision_hessian.columns.numpy()[:collision_nnz].copy()
+
+        previous = self._ldlt_collision_pattern
+        same_collision_pattern = (
+            previous is not None
+            and np.array_equal(collision_offsets, previous[0])
+            and np.array_equal(collision_columns, previous[1])
+        )
+
+        n = self.A.shape[0]
+        block_nnz = self.A.nnz_sync()
+        scalar_nnz = block_nnz * 9
+        reuse_symbolic = (
+            self._ldlt_solver is not None
+            and same_collision_pattern
+            and scalar_nnz == self._ldlt_scalar_nnz
+        )
+
+        if not reuse_symbolic:
+            self._ldlt_offsets = wp.empty(n + 1, dtype=int, device=self.A.device)
+            self._ldlt_columns = wp.empty(scalar_nnz, dtype=int, device=self.A.device)
+            self._ldlt_values = wp.empty(scalar_nnz, dtype=scalar, device=self.A.device)
+
+        wp.launch(
+            bsr_to_scalar_csr,
+            dim=n + 1,
+            inputs=[
+                self.A.offsets,
+                self.A.columns,
+                self.A.values,
+                self._ldlt_offsets,
+                self._ldlt_columns,
+                self._ldlt_values,
+                self.A.nrow,
+            ],
+            device=self.A.device,
+        )
+
+        if reuse_symbolic:
+            self._ldlt_solver.refactorize(self._ldlt_values.ptr)
+            self.ldlt_refactorizations += 1
+        else:
+            self._ldlt_solver = CUSolverDevice(
+                self._ldlt_offsets.ptr,
+                self._ldlt_columns.ptr,
+                self._ldlt_values.ptr,
+                n,
+                scalar_nnz,
+            )
+            self._ldlt_solver.analyze_pattern()
+            self._ldlt_solver.factorize()
+            self._ldlt_scalar_nnz = scalar_nnz
+            self.ldlt_symbolic_factorizations += 1
+
+        self._ldlt_collision_pattern = (collision_offsets, collision_columns)
+        self._ldlt_solver.solve(self.b.ptr, self.states.dx.ptr)
 
 @wp.kernel
 def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar)):
