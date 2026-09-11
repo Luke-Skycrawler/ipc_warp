@@ -45,9 +45,9 @@ def _copy(dst: wp.array(dtype = wp.vec3), src: wp.array(dtype = vec3)):
     dst[i] = wp.vec3(src[i])
 
 @wp.kernel
-def _negate(dst: wp.array(dtype = vec3), src: wp.array(dtype = vec3)):
+def _add_dx(dst: wp.array(dtype = vec3), x0: wp.array(dtype = vec3), dx: wp.array(dtype = vec3)):
     i = wp.tid()
-    dst[i] = -src[i]
+    dst[i] = x0[i] - dx[i]
 
 # @wp.struct 
 # class ContactInfo:
@@ -59,6 +59,7 @@ def _negate(dst: wp.array(dtype = vec3), src: wp.array(dtype = vec3)):
 @wp.struct 
 class XConstraint: 
     a1a2b1b2: wp.vec4i
+    e0e1: wp.vec2i 
     l0: scalar
     alpha: scalar
     lam: scalar
@@ -166,13 +167,17 @@ def _hash(a1: int, b1: int) -> int:
     return h % 8191
 
 @wp.func
-def append(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness: float):
+def append(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness: float, ei: int, ej: int):
+    '''
+    for edges ei < ej; for point-triangle i, j is the index for point and triangle respectively 
+    '''
     idx = wp.atomic_add(contacts.cnt, 0, 1)
     if idx < contacts.capacity:
         h = _hash(a1, b1)
         contacts.list[idx].a1a2b1b2 = wp.vec4i(a1, a2, b1, b2)
         contacts.list[idx].l0 = scalar(thickness * 2.0)
         contacts.list[idx].alpha = scalar(1e-6)
+        contacts.list[idx].e0e1 = wp.vec2i(ei, ej)
         contacts.htable[h] = idx
 
 @wp.kernel
@@ -204,7 +209,7 @@ def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thicknes
                 std = wp.closest_point_edge_edge(p1, p2, q1, q2, 1e-6)
                 dist = std[2]
                 if dist < thickness * 2.0:
-                    append(contacts, a1, a2, b1, b2, thickness)
+                    append(contacts, a1, a2, b1, b2, thickness, i, j)
 @wp.func
 def closest_point_triangle(
     p: wp.vec3,
@@ -310,7 +315,7 @@ def point_triangle_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thi
 
                 dist = std[2]
                 if dist < thickness * 2.0:
-                    append(contacts, i, t2, t1, t3, thickness)
+                    append(contacts, i, t2, t1, t3, thickness, i, j)
 
 @wp.func 
 def fix_interference(v: wp.vec4i, color: wp.array(dtype = int), dirty: wp.array(dtype = bool)):
@@ -366,7 +371,7 @@ class ContactSolverBase:
         self.ccd_edge_upper = wp.zeros((n_edges,), dtype=wp.vec3)
         self.ccd_edge_bvh = wp.Bvh(self.ccd_edge_lower, self.ccd_edge_upper)
         self.ccd_toi = wp.ones((1,), dtype=scalar)
-        self.ccd_dx = wp.zeros_like(self.soup.x_transformed)
+        self.ccd_x1 = wp.zeros_like(self.soup.x_transformed)
         
         # triangles 
         self.has_triangles = self.soup.triangles.shape[0] > 0
@@ -438,11 +443,11 @@ class ContactSolverBase:
         """Return a zero-thickness CCD upper bound for the solver update x -= alpha * dx."""
         n_edges = self.soup.edges.shape[0] // 2
         padding = scalar(1e-7)
-        wp.launch(_negate, self.soup.x_transformed.shape[0], inputs=[self.ccd_dx, dx])
+        wp.launch(_add_dx, self.soup.x_transformed.shape[0], inputs=[self.ccd_x1, self.soup.x_transformed, dx])
         wp.launch(
             swept_edge_aabbs,
             n_edges,
-            inputs=[self.soup.x_transformed, self.ccd_dx, self.soup.edges,
+            inputs=[self.soup.x_transformed, self.ccd_x1, self.soup.edges,
                     self.ccd_edge_lower, self.ccd_edge_upper, padding],
         )
         self.ccd_edge_bvh.refit()
@@ -450,7 +455,7 @@ class ContactSolverBase:
         wp.launch(
             edge_edge_toi,
             n_edges,
-            inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, self.ccd_dx,
+            inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, self.ccd_x1,
                     self.soup.edges, self.soup.body, self.ccd_edge_lower,
                     self.ccd_edge_upper, self.ccd_toi, disable_self_collision],
         )
@@ -460,14 +465,56 @@ class ContactSolverBase:
             wp.launch(
                 swept_triangle_aabbs,
                 n_triangles,
-                inputs=[self.soup.x_transformed, self.ccd_dx, self.soup.triangles,
+                inputs=[self.soup.x_transformed, self.ccd_x1, self.soup.triangles,
                         self.ccd_triangle_lower, self.ccd_triangle_upper, padding],
             )
             self.ccd_triangle_bvh.refit()
             wp.launch(
                 point_triangle_toi,
                 self.soup.x_transformed.shape[0],
-                inputs=[self.ccd_triangle_bvh.id, self.soup.x_transformed, self.ccd_dx,
+                inputs=[self.ccd_triangle_bvh.id, self.soup.x_transformed, self.ccd_x1,
+                        self.soup.triangles, self.soup.body, self.ccd_toi,
+                        padding, disable_self_collision],
+            )
+
+        with self.profile_timer("ccd toi host transfer"):
+            toi = float(self.ccd_toi.numpy()[0])
+        return 0.9 * toi if toi < 1.0 else 1.0
+
+    def new_intersections(self, x0, x1):
+        """Return a zero-thickness CCD upper bound for the solver update x -= alpha * dx."""
+        n_edges = self.soup.edges.shape[0] // 2
+        padding = scalar(1e-7)
+        
+        wp.launch(
+            swept_edge_aabbs,
+            n_edges,
+            inputs=[x0, x1, self.soup.edges,
+                    self.ccd_edge_lower, self.ccd_edge_upper, padding],
+        )
+        self.ccd_edge_bvh.refit()
+        self.ccd_toi.fill_(1.0)
+        wp.launch(
+            edge_edge_toi,
+            n_edges,
+            inputs=[self.ccd_edge_bvh.id, x0, x1,
+                    self.soup.edges, self.soup.body, self.ccd_edge_lower,
+                    self.ccd_edge_upper, self.ccd_toi, disable_self_collision],
+        )
+
+        if self.has_triangles:
+            n_triangles = self.soup.triangles.shape[0] // 3
+            wp.launch(
+                swept_triangle_aabbs,
+                n_triangles,
+                inputs=[x0, x1, self.soup.triangles,
+                        self.ccd_triangle_lower, self.ccd_triangle_upper, padding],
+            )
+            self.ccd_triangle_bvh.refit()
+            wp.launch(
+                point_triangle_toi,
+                self.soup.x_transformed.shape[0],
+                inputs=[self.ccd_triangle_bvh.id, x0, x1,
                         self.soup.triangles, self.soup.body, self.ccd_toi,
                         padding, disable_self_collision],
             )

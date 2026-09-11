@@ -166,7 +166,7 @@ def conservative_pt_toi(
 @wp.kernel
 def swept_edge_aabbs(
     x: wp.array(dtype=vec3),
-    dx: wp.array(dtype=vec3),
+    x_end: wp.array(dtype=vec3),
     edges: wp.array(dtype=int),
     lower: wp.array(dtype=wp.vec3),
     upper: wp.array(dtype=wp.vec3),
@@ -177,8 +177,8 @@ def swept_edge_aabbs(
     i1 = edges[2 * i + 1]
     x0 = x[i0]
     x1 = x[i1]
-    x0_end = x0 + dx[i0]
-    x1_end = x1 + dx[i1]
+    x0_end = x_end[i0]
+    x1_end = x_end[i1]
     lo = wp.min(wp.min(x0, x1), wp.min(x0_end, x1_end)) - vec3(padding)
     hi = wp.max(wp.max(x0, x1), wp.max(x0_end, x1_end)) + vec3(padding)
     lower[i] = wp.vec3(lo)
@@ -188,7 +188,7 @@ def swept_edge_aabbs(
 @wp.kernel
 def swept_triangle_aabbs(
     x: wp.array(dtype=vec3),
-    dx: wp.array(dtype=vec3),
+    x_end: wp.array(dtype=vec3),
     triangles: wp.array(dtype=int),
     lower: wp.array(dtype=wp.vec3),
     upper: wp.array(dtype=wp.vec3),
@@ -201,9 +201,9 @@ def swept_triangle_aabbs(
     x0 = x[i0]
     x1 = x[i1]
     x2 = x[i2]
-    x0_end = x0 + dx[i0]
-    x1_end = x1 + dx[i1]
-    x2_end = x2 + dx[i2]
+    x0_end = x_end[i0]
+    x1_end = x_end[i1]
+    x2_end = x_end[i2]
     lo = wp.min(wp.min(wp.min(x0, x1), x2), wp.min(wp.min(x0_end, x1_end), x2_end)) - vec3(padding)
     hi = wp.max(wp.max(wp.max(x0, x1), x2), wp.max(wp.max(x0_end, x1_end), x2_end)) + vec3(padding)
     lower[i] = wp.vec3(lo)
@@ -360,8 +360,8 @@ def ee_collision_time(
 @wp.kernel
 def point_triangle_toi(
     triangle_bvh: wp.uint64,
-    x: wp.array(dtype=vec3),
-    dx: wp.array(dtype=vec3),
+    x0: wp.array(dtype=vec3),
+    x1: wp.array(dtype=vec3),
     triangles: wp.array(dtype=int),
     body: wp.array(dtype=int),
     toi: wp.array(dtype=scalar),
@@ -369,8 +369,8 @@ def point_triangle_toi(
     exclude_same_body: bool,
 ):
     i = wp.tid()
-    p0 = x[i]
-    p1 = p0 + dx[i]
+    p0 = x0[i]
+    p1 = x1[i]
     query = wp.bvh_query_aabb(
         triangle_bvh,
         wp.vec3(wp.min(p0, p1) - vec3(padding)),
@@ -387,8 +387,8 @@ def point_triangle_toi(
         if not connected and not filtered:
             # t = conservative_pt_toi(
             t = pt_collision_time(
-                p0, x[t0], x[t1], x[t2],
-                p1, x[t0] + dx[t0], x[t1] + dx[t1], x[t2] + dx[t2],
+                p0, x0[t0], x0[t1], x0[t2],
+                p1, x1[t0], x1[t1], x1[t2],
             )
             if t < scalar(1.0):
                 wp.atomic_min(toi, 0, t)
@@ -397,8 +397,8 @@ def point_triangle_toi(
 @wp.kernel
 def edge_edge_toi(
     edge_bvh: wp.uint64,
-    x: wp.array(dtype=vec3),
-    dx: wp.array(dtype=vec3),
+    x0: wp.array(dtype=vec3),
+    x1: wp.array(dtype=vec3),
     edges: wp.array(dtype=int),
     body: wp.array(dtype=int),
     lower: wp.array(dtype=wp.vec3),
@@ -420,8 +420,8 @@ def edge_edge_toi(
         if i < j and not connected and not filtered:
             # t = conservative_ee_toi(
             t = ee_collision_time(
-                x[a0], x[a1], x[b0], x[b1],
-                x[a0] + dx[a0], x[a1] + dx[a1], x[b0] + dx[b0], x[b1] + dx[b1],
+                x0[a0], x0[a1], x0[b0], x0[b1],
+                x1[a0], x1[a1], x1[b0], x1[b1],
             )
             if t < scalar(1.0):
                 wp.atomic_min(toi, 0, t)
