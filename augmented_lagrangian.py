@@ -17,6 +17,7 @@ from warp.sparse import bsr_axpy, bsr_from_triplets
 import contact as contact_module
 from contact import ContactSolverBase, XConstraint, closest_point_triangle
 from dynamic_contacts import (
+    embed_point_edge_distance,
     edge_edge_distance_gradient_hessian,
     point_triangle_distance_gradient_hessian,
 )
@@ -24,6 +25,7 @@ from fem.fem import Triplets
 from fem.interface import RodComplex
 from fem.params import FEMMesh, NewtonState, gravity
 from geometry.static_scene import StaticScene
+from ipctkwp.distance.mollifier import ee_mollifier_threshold, ee_mollifier_value
 from scalar_types import mat33, scalar, vec3, vec12
 from time_integrator_base import RodBCBase
 from viewer import PSViewer
@@ -32,6 +34,9 @@ DECAY_FACTOR = scalar(0.9)
 ACTIVE_SET_DECAY_THRESHOLD = scalar(0.01)
 MU_DIAGONAL_SCALE = scalar(0.1)
 TOI_FILTER_EPS = scalar(1.0e-12)
+# m < 1 is exactly the region where IPC's EE mollifier is active.  The AL
+# formulation uses it as a classifier and switches to a stable PE constraint.
+EE_MOLLIFIER_POINT_EDGE_THRESHOLD = scalar(1.0)
 
 
 @wp.struct
@@ -43,6 +48,9 @@ class ALConstraint:
     lam: scalar
     gamma: scalar
     slack: scalar
+    mollifier: scalar
+    # 0: regular EE, 1/2: edge-A endpoint against B, 3/4: B against A.
+    distance_type: int
     # c(x_hat) = d0 + grad^T x_hat.
     d0: scalar
     grad: vec12
@@ -87,6 +95,8 @@ def to_al_constraint(xc: XConstraint) -> ALConstraint:
     result.lam = scalar(0.0)
     result.gamma = scalar(1.0)
     result.slack = scalar(0.0)
+    result.mollifier = scalar(1.0)
+    result.distance_type = 0
     result.d0 = scalar(0.0)
     result.grad = vec12()
     return result
@@ -187,11 +197,83 @@ def register_merge(new: Hash, old: Hash, destination: Hash, n_old: int, n_new: i
         destination.cell_entries[output] = c
 
 
+@wp.func
+def point_line_distance_squared(point: vec3, edge0: vec3, edge1: vec3):
+    edge = edge1 - edge0
+    alpha = wp.dot(point - edge0, edge) / wp.max(wp.dot(edge, edge), scalar(1.0e-30))
+    offset = point - (edge0 + alpha * edge)
+    return alpha, wp.dot(offset, offset)
+
+
+@wp.func
+def parallel_edge_point_edge_distance(
+    x0: vec3, x1: vec3, x2: vec3, x3: vec3
+):
+    """Choose a deterministic PE representation for a near-parallel EE pair.
+
+    Candidates whose projection lies on the opposite segment are preferred.
+    This retains the segment distance for overlapping parallel edges.  If the
+    segments do not overlap, the nearest infinite-line PE candidate is used,
+    which still provides a finite, consistently oriented normal.
+    """
+    alpha0, distance0 = point_line_distance_squared(x0, x2, x3)
+    alpha1, distance1 = point_line_distance_squared(x1, x2, x3)
+    alpha2, distance2 = point_line_distance_squared(x2, x0, x1)
+    alpha3, distance3 = point_line_distance_squared(x3, x0, x1)
+    large = scalar(1.0e30)
+    score0 = distance0
+    score1 = distance1
+    score2 = distance2
+    score3 = distance3
+    if alpha0 < scalar(0.0) or alpha0 > scalar(1.0):
+        score0 = large
+    if alpha1 < scalar(0.0) or alpha1 > scalar(1.0):
+        score1 = large
+    if alpha2 < scalar(0.0) or alpha2 > scalar(1.0):
+        score2 = large
+    if alpha3 < scalar(0.0) or alpha3 > scalar(1.0):
+        score3 = large
+
+    # If no endpoint projects onto the opposite segment, retain the same
+    # deterministic selection rule without the segment-validity preference.
+    if wp.min(wp.min(score0, score1), wp.min(score2, score3)) == large:
+        score0 = distance0
+        score1 = distance1
+        score2 = distance2
+        score3 = distance3
+
+    distance_type = int(1)
+    best = score0
+    if score1 < best:
+        best = score1
+        distance_type = 2
+    if score2 < best:
+        best = score2
+        distance_type = 3
+    if score3 < best:
+        best = score3
+        distance_type = 4
+
+    if distance_type == 1:
+        grad, hess = embed_point_edge_distance(x0, x2, x3, 0, 2, 3)
+        return grad, hess, distance0, distance_type
+    if distance_type == 2:
+        grad, hess = embed_point_edge_distance(x1, x2, x3, 1, 2, 3)
+        return grad, hess, distance1, distance_type
+    if distance_type == 3:
+        grad, hess = embed_point_edge_distance(x2, x0, x1, 2, 0, 1)
+        return grad, hess, distance2, distance_type
+    grad, hess = embed_point_edge_distance(x3, x0, x1, 3, 0, 1)
+    return grad, hess, distance3, distance_type
+
+
 @wp.kernel
 def linearize_constraints(
     hash_table: Hash,
     x_safe: wp.array(dtype=vec3),
+    x_rest: wp.array(dtype=vec3),
     is_point_triangle: bool,
+    point_edge_threshold: scalar,
 ):
     i = wp.tid()
     c = hash_table.cell_entries[i]
@@ -203,6 +285,8 @@ def linearize_constraints(
 
     grad_squared = vec12()
     distance_squared = scalar(0.0)
+    mollifier = scalar(1.0)
+    distance_type = int(0)
     if is_point_triangle:
         grad_squared, hessian_unused = point_triangle_distance_gradient_hessian(x0, x1, x2, x3)
         closest, closest_feature = closest_point_triangle(
@@ -210,11 +294,22 @@ def linearize_constraints(
         )
         distance_squared = scalar(closest[2]) * scalar(closest[2])
     else:
-        grad_squared, hessian_unused = edge_edge_distance_gradient_hessian(x0, x1, x2, x3)
-        closest = wp.closest_point_edge_edge(
-            wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3), 1.0e-6
+        eps_x = ee_mollifier_threshold(
+            x_rest[ids[0]], x_rest[ids[1]], x_rest[ids[2]], x_rest[ids[3]]
         )
-        distance_squared = scalar(closest[2]) * scalar(closest[2])
+        mollifier = ee_mollifier_value(x0, x1, x2, x3, eps_x)
+        if mollifier < point_edge_threshold:
+            grad_squared, hessian_unused, distance_squared, distance_type = (
+                parallel_edge_point_edge_distance(x0, x1, x2, x3)
+            )
+        else:
+            grad_squared, hessian_unused = edge_edge_distance_gradient_hessian(
+                x0, x1, x2, x3
+            )
+            closest = wp.closest_point_edge_edge(
+                wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3), 1.0e-6
+            )
+            distance_squared = scalar(closest[2]) * scalar(closest[2])
 
     distance = wp.sqrt(wp.max(distance_squared, scalar(1.0e-30)))
     grad = grad_squared / (scalar(2.0) * distance)
@@ -224,6 +319,8 @@ def linearize_constraints(
         offset -= wp.dot(vertex_grad, x_safe[ids[local]])
     hash_table.cell_entries[i].d0 = offset
     hash_table.cell_entries[i].grad = grad
+    hash_table.cell_entries[i].mollifier = mollifier
+    hash_table.cell_entries[i].distance_type = distance_type
 
 
 @wp.kernel
@@ -449,10 +546,20 @@ class ActiveSet:
         wp.launch(register_merge, n_old + n_new, inputs=[new.hash, self.hash, destination, n_old, n_new])
         self.hash = destination
 
-    def linearize(self, x_safe, is_point_triangle):
+    def linearize(self, x_safe, x_rest, is_point_triangle, point_edge_threshold):
         n_constraints = self.count()
         if n_constraints:
-            wp.launch(linearize_constraints, n_constraints, inputs=[self.hash, x_safe, is_point_triangle])
+            wp.launch(
+                linearize_constraints,
+                n_constraints,
+                inputs=[
+                    self.hash,
+                    x_safe,
+                    x_rest,
+                    is_point_triangle,
+                    point_edge_threshold,
+                ],
+            )
 
     def update_forces(self, x_hat, mu):
         n_constraints = self.count()
@@ -478,6 +585,9 @@ class RodComplexAL(RodBCBase, RodComplex, ContactSolverBase):
         self.minimum_outer_iterations = 2
         self.max_outer_iterations = 100
         self.max_inner_iterations = 20
+        self.ee_mollifier_point_edge_threshold = float(
+            EE_MOLLIFIER_POINT_EDGE_THRESHOLD
+        )
         self.x_t = wp.zeros_like(self.states.x)
         self.x_safe = wp.zeros_like(self.states.x)
         self.x_tilde = wp.zeros_like(self.states.x)
@@ -562,8 +672,18 @@ class RodComplexAL(RodBCBase, RodComplex, ContactSolverBase):
 
     def solve_subproblem(self):
         """Algorithm 2: alternating slack/Newton solve and multiplier update."""
-        self.active_set_ee.linearize(self.x_safe, False)
-        self.active_set_pt.linearize(self.x_safe, True)
+        self.active_set_ee.linearize(
+            self.x_safe,
+            self.soup.xcs,
+            False,
+            self.ee_mollifier_point_edge_threshold,
+        )
+        self.active_set_pt.linearize(
+            self.x_safe,
+            self.soup.xcs,
+            True,
+            self.ee_mollifier_point_edge_threshold,
+        )
         for _ in range(self.max_inner_iterations):
             # Algorithm 2 line 11: update s at the current iterate, then keep
             # it fixed through this Newton direction and line search.
