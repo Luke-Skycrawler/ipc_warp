@@ -177,13 +177,13 @@ def append(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness: fl
     if idx < contacts.capacity:
         h = _hash(a1, b1)
         contacts.list[idx].a1a2b1b2 = wp.vec4i(a1, a2, b1, b2)
-        contacts.list[idx].l0 = scalar(thickness * 2.0)
+        contacts.list[idx].l0 = scalar(thickness) * scalar(2.0)
         contacts.list[idx].alpha = scalar(1e-6)
         contacts.list[idx].e0e1 = wp.vec2i(ei, ej)
         contacts.htable[h] = idx
 
 @wp.func
-def append_ccd(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness: float, ei: int, ej: int, toi: scalar):
+def append_ccd(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness: scalar, ei: int, ej: int, toi: scalar):
     '''
     for edges ei < ej; for point-triangle i, j is the index for point and triangle respectively 
     '''
@@ -191,7 +191,7 @@ def append_ccd(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness
     if idx < contacts.capacity:
         h = _hash(a1, b1)
         contacts.list[idx].a1a2b1b2 = wp.vec4i(a1, a2, b1, b2)
-        contacts.list[idx].l0 = scalar(thickness * 2.0)
+        contacts.list[idx].l0 = thickness * scalar(2.0)
         contacts.list[idx].alpha = toi
         contacts.list[idx].e0e1 = wp.vec2i(ei, ej)
         contacts.htable[h] = idx
@@ -599,6 +599,20 @@ class ContactSolverBase:
                     self.ccd_edge_upper, self.ccd_toi, disable_self_collision, self.contacts_new, _thickness],
         )
         self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
+        if self.n_contacts > self.contacts_new.capacity:
+            self._grow_contact_list(self.contacts_new, self.n_contacts)
+            self.contacts_new.cnt.zero_()
+            self.contacts_new.htable.fill_(-1)
+            self.ccd_toi.fill_(1.0)
+            wp.launch(
+                edge_edge_intersections,
+                n_edges,
+                inputs=[self.ccd_edge_bvh.id, x0, x1,
+                        self.soup.edges, self.soup.body, self.ccd_edge_lower,
+                        self.ccd_edge_upper, self.ccd_toi,
+                        disable_self_collision, self.contacts_new, _thickness],
+            )
+            self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
 
         if self.has_triangles:
 
@@ -621,6 +635,23 @@ class ContactSolverBase:
                         padding, disable_self_collision, self.contacts_pt, _thickness],
             )
             self.n_contacts_pt = int(self.contacts_pt.cnt.numpy()[0]) 
+            if self.n_contacts_pt > self.contacts_pt.capacity:
+                self._grow_contact_list(
+                    self.contacts_pt, self.n_contacts_pt, point_triangle=True
+                )
+                self.contacts_pt.cnt.zero_()
+                self.contacts_pt.htable.fill_(-1)
+                wp.launch(
+                    point_triangle_intersections,
+                    self.soup.x_transformed.shape[0],
+                    inputs=[self.ccd_triangle_bvh.id, x0, x1,
+                            self.soup.triangles, self.soup.body, self.ccd_toi,
+                            padding, disable_self_collision, self.contacts_pt,
+                            _thickness],
+                )
+                self.n_contacts_pt = int(self.contacts_pt.cnt.numpy()[0])
+        else:
+            self.n_contacts_pt = 0
 
         with self.profile_timer("ccd toi host transfer"):
             toi = float(self.ccd_toi.numpy()[0])

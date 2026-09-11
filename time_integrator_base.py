@@ -23,7 +23,7 @@ twist = True
 dirichlet_boundary = True
 attachment_stiffness = scalar(1e11)
 contact_stiffness = scalar(1e9)
-solver_choice = "ldlt"
+solver_choice = "cg"
 wp.config.max_unroll = 1
 wp.config.enable_backward = False
 
@@ -509,9 +509,6 @@ class RodBCBase:
         
     def line_search(self):
         with self.profile_timer("line search"):
-            # if twist:
-            #     return self.line_search_fixed()
-            # FIXME: not converged
             x_tmp = wp.clone(self.states.x)
             wp.copy(self.line_search_reference_x, x_tmp)
             E0 = self.compute_psi() + self.compute_inertia() + self.compute_collision_energy()

@@ -1,409 +1,674 @@
-import numpy as np 
-import warp as wp 
+"""Barrier-free augmented-Lagrangian contact for the Warp FEM solver.
+
+Implements Algorithms 1--3 from Zheng, Luo, and Li, "Robust and Efficient
+Penetration-Free Elastodynamics without Barriers". Candidate states may
+intersect; contact constraints are unsigned distances linearized at the last
+intersection-free state.
+"""
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import warp as wp
+from warp.fem.linalg import array_axpy
+from warp.sparse import bsr_axpy, bsr_from_triplets
+
+import contact as contact_module
+from contact import ContactSolverBase, XConstraint, closest_point_triangle
+from dynamic_contacts import (
+    edge_edge_distance_gradient_hessian,
+    point_triangle_distance_gradient_hessian,
+)
+from fem.fem import Triplets
 from fem.interface import RodComplex
-from scalar_types import *
-from fem.geometry import Soup
-from time_integrator_base import *
-from contact import ContactSolverBase, XConstraint, fetch_dist_v0v1, fetch_dist_v0v1_pt, closest_point_triangle
-from ipctkwp.distance.edge_edge import x_to_grad_psd_hess_ee
-from ipctkwp.distance.point_triangle import x_to_grad_psd_hess_pt
-from ipctkwp.distance.mollifier import ee_mollifier_derivatives, ee_mollifier_value, ee_mollifier_threshold
+from fem.params import FEMMesh, NewtonState, gravity
 from geometry.static_scene import StaticScene
-from dynamic_contacts import edge_edge_distance_gradient_hessian, point_triangle_distance_gradient_hessian
-'''
-reference: [1] Robust and Efficient Penetration-Free Elastodynamics without Barriers
-'''
+from scalar_types import mat33, scalar, vec3, vec12
+from time_integrator_base import RodBCBase
+from viewer import PSViewer
 
-Gamma = scalar(0.9)
+DECAY_FACTOR = scalar(0.9)
+ACTIVE_SET_DECAY_THRESHOLD = scalar(0.01)
+MU_DIAGONAL_SCALE = scalar(0.1)
+TOI_FILTER_EPS = scalar(1.0e-12)
 
-@wp.struct 
+
+@wp.struct
 class ALConstraint:
     a1a2b1b2: wp.vec4i
-    e0e1: wp.vec2i 
+    e0e1: wp.vec2i
     l0: scalar
     alpha: scalar
     lam: scalar
     gamma: scalar
-    
-@wp.struct 
-class Hash: 
-    '''
-    Hash table that supports O(1) query, O(n) traversal and O(n) creation
-    reference: https://github.com/matthias-research/pages/blob/master/tenMinutePhysics/11-hashing.html
-    '''
-    table_size: int 
-    cell_start: wp.array(dtype = int)
-    cell_entries: wp.array(dtype = ALConstraint)
+    slack: scalar
+    # c(x_hat) = d0 + grad^T x_hat.
+    d0: scalar
+    grad: vec12
+
+
+@wp.struct
+class Hash:
+    """Compact hash table supporting lookup and contiguous traversal."""
+
+    table_size: int
+    cell_start: wp.array(dtype=int)
+    cell_entries: wp.array(dtype=ALConstraint)
+
 
 @wp.func
-def hash_pos(hash: Hash, e0: int, e1: int) -> int: 
-    return wp.bit_xor(e0 * 73856093, e1 * 19349663) % hash.table_size
+def hash_pos(hash_table: Hash, e0: int, e1: int) -> int:
+    value = wp.bit_xor(e0 * 73856093, e1 * 19349663)
+    if value < 0:
+        value = -value
+    return value % hash_table.table_size
 
-@wp.func 
-def filter_accept(c: XConstraint, tv: wp.array(dtype = scalar)) -> bool:
-    i0 = c.a1a2b1b2[0]
-    i1 = c.a1a2b1b2[1]
-    i2 = c.a1a2b1b2[2]
-    i3 = c.a1a2b1b2[3]
 
-    ti = c.alpha - scalar(1e-6)
+@wp.func
+def constraint_value(c: ALConstraint, x: wp.array(dtype=vec3)) -> scalar:
+    value = c.d0
+    for local in range(4):
+        vertex = c.a1a2b1b2[local]
+        value += wp.dot(
+            vec3(c.grad[3 * local], c.grad[3 * local + 1], c.grad[3 * local + 2]),
+            x[vertex],
+        )
+    return value
 
-    t0 = tv[i0]
-    t1 = tv[i1]
-    t2 = tv[i2]
-    t3 = tv[i3]
 
-    if ti <= t0 or ti <= t1 or ti <= t2 or ti <= t3: 
-        return True
+@wp.func
+def to_al_constraint(xc: XConstraint) -> ALConstraint:
+    result = ALConstraint()
+    result.a1a2b1b2 = xc.a1a2b1b2
+    result.e0e1 = xc.e0e1
+    result.l0 = xc.l0
+    result.alpha = xc.alpha
+    result.lam = scalar(0.0)
+    result.gamma = scalar(1.0)
+    result.slack = scalar(0.0)
+    result.d0 = scalar(0.0)
+    result.grad = vec12()
+    return result
+
+
+@wp.kernel
+def accumulate_vertex_toi(
+    constraints: wp.array(dtype=XConstraint),
+    vertex_toi: wp.array(dtype=scalar),
+):
+    i = wp.tid()
+    c = constraints[i]
+    for local in range(4):
+        wp.atomic_min(vertex_toi, c.a1a2b1b2[local], c.alpha)
+
+
+@wp.func
+def filter_accept(c: XConstraint, vertex_toi: wp.array(dtype=scalar)) -> bool:
+    for local in range(4):
+        if c.alpha <= vertex_toi[c.a1a2b1b2[local]] + TOI_FILTER_EPS:
+            return True
     return False
-    
-@wp.kernel 
-def count(hash: Hash, constraints: wp.array(dtype = XConstraint), tv: wp.array(dtype = scalar)): 
+
+
+@wp.kernel
+def count_constraints(
+    hash_table: Hash,
+    constraints: wp.array(dtype=XConstraint),
+    vertex_toi: wp.array(dtype=scalar),
+):
     i = wp.tid()
-    if filter_accept(constraints[i], tv):
-        e0e1 = constraints[i].e0e1
-        idx = hash_pos(hash, e0e1[0], e0e1[1])
-        wp.atomic_add(hash.cell_start, idx, 1)
+    c = constraints[i]
+    if filter_accept(c, vertex_toi):
+        key = c.e0e1
+        wp.atomic_add(hash_table.cell_start, hash_pos(hash_table, key[0], key[1]), 1)
 
-@wp.func 
-def to_al_constraint(xc: XConstraint) -> ALConstraint: 
-    al = ALConstraint()
-    al.a1a2b1b2 = xc.a1a2b1b2
-    al.e0e1 = xc.e0e1
-    al.l0 = xc.l0
-    al.alpha = xc.alpha
 
-    al.lam = scalar(0.0)
-    al.gamma = scalar(1.0)
-    return al
-
-@wp.kernel 
-def register_hash(hash: Hash, constraints: wp.array(dtype = XConstraint), tv: wp.array(dtype = scalar)): 
+@wp.kernel
+def register_constraints(
+    hash_table: Hash,
+    constraints: wp.array(dtype=XConstraint),
+    vertex_toi: wp.array(dtype=scalar),
+):
     i = wp.tid()
-    if filter_accept(constraints[i], tv):
-        e0e1 = constraints[i].e0e1
-        idx = hash_pos(hash, e0e1[0], e0e1[1])
+    c = constraints[i]
+    if filter_accept(c, vertex_toi):
+        key = c.e0e1
+        bucket = hash_pos(hash_table, key[0], key[1])
+        output = wp.atomic_add(hash_table.cell_start, bucket, -1) - 1
+        hash_table.cell_entries[output] = to_al_constraint(c)
 
-        fill_in_idx = wp.atomic_add(hash.cell_start, idx, -1) - 1
-
-        hash.cell_entries[fill_in_idx] = to_al_constraint(constraints[i])
 
 @wp.func
-def filter_old(c: ALConstraint) -> bool:
-    return c.gamma >= scalar(0.01)
+def keep_old(c: ALConstraint) -> bool:
+    return c.gamma >= ACTIVE_SET_DECAY_THRESHOLD
 
-@wp.func 
-def filter_new(old: Hash, c: ALConstraint) -> bool:
-    '''
-    decline existing constraints that are already in the old hash table
-    '''
-    e0e1 = c.e0e1
-    idx = hash_pos(old, e0e1[0], e0e1[1])
-    for i in range(old.cell_start[idx], old.cell_start[idx + 1]): 
-        if old.cell_entries[i].e0e1[0] == e0e1[0] and old.cell_entries[i].e0e1[1] == e0e1[1]: 
+
+@wp.func
+def is_new_constraint(old: Hash, c: ALConstraint) -> bool:
+    key = c.e0e1
+    bucket = hash_pos(old, key[0], key[1])
+    for i in range(old.cell_start[bucket], old.cell_start[bucket + 1]):
+        old_key = old.cell_entries[i].e0e1
+        if old_key[0] == key[0] and old_key[1] == key[1]:
             return False
     return True
 
 @wp.kernel
-def count_merge(new: Hash, old: Hash, dst: Hash, n_old: int, n_new: int):
-    i = wp.tid() 
-    old = i < n_old
-
-    if old: 
-        if filter_old(old.cell_entries[i]):
-            e0e1 = old.cell_entries[i].e0e1
-            idx = hash_pos(dst, e0e1[0], e0e1[1])
-            wp.atomic_add(dst.cell_start, idx, 1)
-    else:
-        if filter_new(old, new.cell_entries[i - n_old]): 
-            e0e1 = new.cell_entries[i - n_old].e0e1
-            idx = hash_pos(dst, e0e1[0], e0e1[1])
-            wp.atomic_add(dst.cell_start, idx, 1)
-            
-@wp.kernel 
-def register_merge(new: Hash, old: Hash, dst: Hash, n_old: int, n_new: int):
+def count_merge(new: Hash, old: Hash, destination: Hash, n_old: int, n_new: int):
     i = wp.tid()
-    old = i < n_old
-    if old: 
-        if filter_old(old.cell_entries[i]):
-            e0e1 = old.cell_entries[i].e0e1
-            idx = hash_pos(dst, e0e1[0], e0e1[1])
-            fill_in_idx = wp.atomic_add(dst.cell_start, idx, -1) - 1
-            dst.cell_entries[fill_in_idx] = old.cell_entries[i]
-    else: 
-        if filter_new(old, new.cell_entries[i - n_old]): 
-            e0e1 = new.cell_entries[i - n_old].e0e1
-            idx = hash_pos(dst, e0e1[0], e0e1[1])
-            fill_in_idx = wp.atomic_add(dst.cell_start, idx, -1) - 1
-            dst.cell_entries[fill_in_idx] = new.cell_entries[i - n_old]
+    if i < n_old:
+        c = old.cell_entries[i]
+        if keep_old(c):
+            key = c.e0e1
+            wp.atomic_add(destination.cell_start, hash_pos(destination, key[0], key[1]), 1)
+    else:
+        c = new.cell_entries[i - n_old]
+        if is_new_constraint(old, c):
+            key = c.e0e1
+            wp.atomic_add(destination.cell_start, hash_pos(destination, key[0], key[1]), 1)
 
-
-@wp.func 
-def fetch_dist_squared_ee(soup: Soup, c: ALConstraint):
-    i0 = c.a1a2b1b2[0]
-    i1 = c.a1a2b1b2[1]
-    i2 = c.a1a2b1b2[2]
-    i3 = c.a1a2b1b2[3]
-    
-    b0 = soup.body[i0]
-    b1 = soup.body[i2]
-
-    x0 = soup.x_transformed[i0]
-    x1 = soup.x_transformed[i1]
-    x2 = soup.x_transformed[i2]
-    x3 = soup.x_transformed[i3]
-
-    dab = wp.closest_point_edge_edge(wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3), eps)
-    v0 = wp.lerp(x0, x1, scalar(dab[0]))
-    v1 = wp.lerp(x2, x3, scalar(dab[1]))
-
-    dist = scalar(dab[2])
-
-    return dist * dist
-
-
-@wp.func 
-def fetch_dist_squared_pt(soup: Soup, c: ALConstraint):
-    '''
-    i, t0, t1, t2 
-    '''
-    i = c.a1a2b1b2[0]
-    t0 = c.a1a2b1b2[1]
-    t1 = c.a1a2b1b2[2]
-    t2 = c.a1a2b1b2[3]
-    
-    
-    x0 = soup.x_transformed[i]
-    x1 = soup.x_transformed[t0]
-    x2 = soup.x_transformed[t1]
-    x3 = soup.x_transformed[t2]
-
-    dab, type = closest_point_triangle(wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3))
-
-    v0 = x0
-    alpha = scalar(dab[0])
-    beta = scalar(dab[1])
-    v1 = alpha * x1 + beta * x2 + (scalar(1.0) - alpha - beta) * x3
-
-    dist = scalar(dab[2])
-
-    return dist * dist
 
 @wp.kernel
-def update_active_set_forces(hash: Hash, is_pt: bool, mu: scalar): 
+def register_merge(new: Hash, old: Hash, destination: Hash, n_old: int, n_new: int):
     i = wp.tid()
-    z = scalar(0.0)
-    hi = hash.cell_entries[i]
-
-    d = 0.0
-    if is_pt: 
-        d = fetch_dist_squared_pt() 
+    accepted = False
+    c = ALConstraint()
+    if i < n_old:
+        c = old.cell_entries[i]
+        accepted = keep_old(c)
     else:
-        d = fetch_dist_squared_ee()
-    delta = hi.l0
-    ci = d - delta * delta
-
-    si = wp.max(z, ci - hi.lam / mu)
-
-    if si == z: 
-        hash.cell_entries[i].lam = hi.lam - mu * ci
-        hash.cell_entries[i].gamma *= Gamma
-    else: 
-        hash.cell_entries[i].lam = z
-        hash.cell_entries[i].gamma = scalar(1.0)
+        c = new.cell_entries[i - n_old]
+        accepted = is_new_constraint(old, c)
+    if accepted:
+        key = c.e0e1
+        bucket = hash_pos(destination, key[0], key[1])
+        output = wp.atomic_add(destination.cell_start, bucket, -1) - 1
+        destination.cell_entries[output] = c
 
 
-class ActiveSet: 
-    '''
-    Hash table 
-    '''
-    def __init__(self, n_edges, n_triangles, n_surface_nodes, contact_volume): 
-        self.hash = self.reserve(contact_volume)
+@wp.kernel
+def linearize_constraints(
+    hash_table: Hash,
+    x_safe: wp.array(dtype=vec3),
+    is_point_triangle: bool,
+):
+    i = wp.tid()
+    c = hash_table.cell_entries[i]
+    ids = c.a1a2b1b2
+    x0 = x_safe[ids[0]]
+    x1 = x_safe[ids[1]]
+    x2 = x_safe[ids[2]]
+    x3 = x_safe[ids[3]]
 
-    def reserve(self, contact_volume):
-        self.contact_volume = contact_volume
-        hash = Hash()
-        hash.table_size = 2 * contact_volume 
-        hash.cell_start = wp.zeros((hash.table_size + 1, ), dtype = int)
-        hash.cell_entries = wp.zeros((contact_volume, ), dtype = ALConstraint)
-        return hash
+    grad_squared = vec12()
+    distance_squared = scalar(0.0)
+    if is_point_triangle:
+        grad_squared, hessian_unused = point_triangle_distance_gradient_hessian(x0, x1, x2, x3)
+        closest, closest_feature = closest_point_triangle(
+            wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3)
+        )
+        distance_squared = scalar(closest[2]) * scalar(closest[2])
+    else:
+        grad_squared, hessian_unused = edge_edge_distance_gradient_hessian(x0, x1, x2, x3)
+        closest = wp.closest_point_edge_edge(
+            wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3), 1.0e-6
+        )
+        distance_squared = scalar(closest[2]) * scalar(closest[2])
 
-    def create_hash(self, constraints, n_constraints): 
+    distance = wp.sqrt(wp.max(distance_squared, scalar(1.0e-30)))
+    grad = grad_squared / (scalar(2.0) * distance)
+    offset = distance - c.l0
+    for local in range(4):
+        vertex_grad = vec3(grad[3 * local], grad[3 * local + 1], grad[3 * local + 2])
+        offset -= wp.dot(vertex_grad, x_safe[ids[local]])
+    hash_table.cell_entries[i].d0 = offset
+    hash_table.cell_entries[i].grad = grad
+
+
+@wp.kernel
+def update_slack_variables(hash_table: Hash, x_hat: wp.array(dtype=vec3), mu: scalar):
+    i = wp.tid()
+    c = hash_table.cell_entries[i]
+    ci = constraint_value(c, x_hat)
+    hash_table.cell_entries[i].slack = wp.max(scalar(0.0), ci - c.lam / mu)
+
+
+@wp.kernel
+def update_active_set_forces(hash_table: Hash, x_hat: wp.array(dtype=vec3), mu: scalar):
+    i = wp.tid()
+    c = hash_table.cell_entries[i]
+    ci = constraint_value(c, x_hat)
+    if c.slack == scalar(0.0):
+        hash_table.cell_entries[i].lam = c.lam - mu * ci
+        hash_table.cell_entries[i].gamma = scalar(1.0)
+    else:
+        hash_table.cell_entries[i].lam = scalar(0.0)
+        hash_table.cell_entries[i].gamma = c.gamma * DECAY_FACTOR
+
+
+@wp.kernel
+def contact_gauss_newton_ee(
+    states: NewtonState,
+    constraints: wp.array(dtype=ALConstraint),
+    triplets: Triplets,
+    gradient: wp.array(dtype=vec3),
+    mu: scalar,
+):
+    i = wp.tid()
+    c = constraints[i]
+    ci = constraint_value(c, states.x)
+    residual = ci - c.lam / mu - c.slack
+    scale = mu * c.gamma
+    for row in range(4):
+        gi = vec3(c.grad[3 * row], c.grad[3 * row + 1], c.grad[3 * row + 2])
+        wp.atomic_add(gradient, c.a1a2b1b2[row], scale * residual * gi)
+        for column in range(4):
+            gj = vec3(c.grad[3 * column], c.grad[3 * column + 1], c.grad[3 * column + 2])
+            index = i * 16 + row * 4 + column
+            triplets.rows[index] = c.a1a2b1b2[row]
+            triplets.cols[index] = c.a1a2b1b2[column]
+            triplets.vals[index] = scale * wp.outer(gi, gj)
+
+
+@wp.kernel
+def contact_gauss_newton_pt(
+    states: NewtonState,
+    constraints: wp.array(dtype=ALConstraint),
+    triplets: Triplets,
+    gradient: wp.array(dtype=vec3),
+    mu: scalar,
+    contact_offset: int,
+):
+    i = wp.tid()
+    c = constraints[i]
+    ci = constraint_value(c, states.x)
+    residual = ci - c.lam / mu - c.slack
+    scale = mu * c.gamma
+    for row in range(4):
+        gi = vec3(c.grad[3 * row], c.grad[3 * row + 1], c.grad[3 * row + 2])
+        wp.atomic_add(gradient, c.a1a2b1b2[row], scale * residual * gi)
+        for column in range(4):
+            gj = vec3(c.grad[3 * column], c.grad[3 * column + 1], c.grad[3 * column + 2])
+            index = (contact_offset + i) * 16 + row * 4 + column
+            triplets.rows[index] = c.a1a2b1b2[row]
+            triplets.cols[index] = c.a1a2b1b2[column]
+            triplets.vals[index] = scale * wp.outer(gi, gj)
+
+
+@wp.kernel
+def collision_energy_kernel(
+    x_hat: wp.array(dtype=vec3),
+    constraints: wp.array(dtype=ALConstraint),
+    mu: scalar,
+    energy: wp.array(dtype=scalar),
+):
+    i = wp.tid()
+    c = constraints[i]
+    ci = constraint_value(c, x_hat)
+    equality_residual = ci - c.slack
+    value = c.gamma * (
+        scalar(0.5) * mu * equality_residual * equality_residual
+        - c.lam * equality_residual
+    )
+    wp.atomic_add(energy, 0, value)
+
+
+@wp.kernel
+def compute_tilde_x_kernel(
+    x_tilde: wp.array(dtype=vec3),
+    x_t: wp.array(dtype=vec3),
+    velocity: wp.array(dtype=vec3),
+    h: scalar,
+):
+    i = wp.tid()
+    x_tilde[i] = x_t[i] + h * velocity[i] + h * h * gravity
+
+
+@wp.kernel
+def compute_rhs_tilde(
+    state: NewtonState,
+    x_tilde: wp.array(dtype=vec3),
+    h: scalar,
+    mass: wp.array(dtype=scalar),
+    gradient: wp.array(dtype=vec3),
+):
+    i = wp.tid()
+    gradient[i] = -h * h * gradient[i] + mass[i] * (state.x[i] - x_tilde[i])
+
+
+@wp.kernel
+def compute_inertia_tilde(
+    state: NewtonState,
+    geo: FEMMesh,
+    x_tilde: wp.array(dtype=vec3),
+    mass: wp.array(dtype=scalar),
+    energy: wp.array(dtype=scalar),
+):
+    i = wp.tid()
+    if geo.fixed[i] == 0:
+        displacement = state.x[i] - x_tilde[i]
+        wp.atomic_add(energy, 0, scalar(0.5) * mass[i] * wp.length_sq(displacement))
+
+
+@wp.kernel
+def apply_boundary_target(state: NewtonState, geo: FEMMesh, residual: wp.array(dtype=vec3)):
+    i = wp.tid()
+    if geo.fixed[i] != 0:
+        state.x[i] -= residual[i]
+
+
+@wp.kernel
+def eliminate_fixed_dofs(
+    offsets: wp.array(dtype=int),
+    columns: wp.array(dtype=int),
+    values: wp.array(dtype=mat33),
+    fixed: wp.array(dtype=int),
+):
+    row = wp.tid()
+    for index in range(offsets[row], offsets[row + 1]):
+        column = columns[index]
+        if fixed[row] != 0 or fixed[column] != 0:
+            if row == column and fixed[row] != 0:
+                values[index] = wp.identity(3, dtype=scalar)
+            else:
+                values[index] = mat33()
+
+
+@wp.kernel
+def eliminate_fixed_gradient(gradient: wp.array(dtype=vec3), fixed: wp.array(dtype=int)):
+    i = wp.tid()
+    if fixed[i] != 0:
+        gradient[i] = vec3()
+
+
+@wp.kernel
+def max_diagonal(
+    offsets: wp.array(dtype=int),
+    columns: wp.array(dtype=int),
+    values: wp.array(dtype=mat33),
+    result: wp.array(dtype=scalar),
+):
+    row = wp.tid()
+    for index in range(offsets[row], offsets[row + 1]):
+        if columns[index] == row:
+            block = values[index]
+            wp.atomic_max(result, 0, wp.max(block[0, 0], wp.max(block[1, 1], block[2, 2])))
+
+
+@wp.kernel
+def blend_feasible_state(
+    x_safe: wp.array(dtype=vec3),
+    x_hat: wp.array(dtype=vec3),
+    alpha: scalar,
+):
+    i = wp.tid()
+    x_safe[i] = wp.lerp(x_safe[i], x_hat[i], alpha)
+
+
+class ActiveSet:
+    def __init__(self, contact_volume):
+        self.hash = self.reserve(max(1, contact_volume))
+
+    @staticmethod
+    def reserve(contact_volume):
+        hash_table = Hash()
+        hash_table.table_size = max(2, 2 * contact_volume)
+        hash_table.cell_start = wp.zeros(hash_table.table_size + 1, dtype=int)
+        hash_table.cell_entries = wp.zeros(contact_volume, dtype=ALConstraint)
+        return hash_table
+
+    @property
+    def capacity(self):
+        return self.hash.cell_entries.shape[0]
+
+    def count(self):
+        return int(self.hash.cell_start.numpy()[-1])
+
+    def create_hash(self, constraints, n_constraints, vertex_toi):
+        required = max(1, n_constraints)
+        if required > self.capacity:
+            self.hash = self.reserve(1 << (required - 1).bit_length())
         self.hash.cell_start.zero_()
         self.hash.cell_entries.zero_()
+        if n_constraints == 0:
+            return
+        wp.launch(count_constraints, n_constraints, inputs=[self.hash, constraints, vertex_toi])
+        wp.utils.array_scan(self.hash.cell_start, self.hash.cell_start, inclusive=True)
+        wp.launch(register_constraints, n_constraints, inputs=[self.hash, constraints, vertex_toi])
 
-        wp.launch(count, dim = (n_constraints, ), inputs = [self.hash, constraints])
+    def merge(self, new):
+        n_old = self.count()
+        n_new = new.count()
+        destination = self.reserve(max(1, n_old + n_new))
+        if n_old + n_new == 0:
+            self.hash = destination
+            return
+        wp.launch(count_merge, n_old + n_new, inputs=[new.hash, self.hash, destination, n_old, n_new])
+        wp.utils.array_scan(destination.cell_start, destination.cell_start, inclusive=True)
+        wp.launch(register_merge, n_old + n_new, inputs=[new.hash, self.hash, destination, n_old, n_new])
+        self.hash = destination
 
-        # prefix sum using wp.tile_scan_inclusive
-        wp.launch_tiled(tile_scan_inclusive, dim=[], inputs=[self.hash.cell_entries], block_dim=64)
+    def linearize(self, x_safe, is_point_triangle):
+        n_constraints = self.count()
+        if n_constraints:
+            wp.launch(linearize_constraints, n_constraints, inputs=[self.hash, x_safe, is_point_triangle])
+
+    def update_forces(self, x_hat, mu):
+        n_constraints = self.count()
+        if n_constraints:
+            wp.launch(update_active_set_forces, n_constraints, inputs=[self.hash, x_hat, mu])
+
+    def update_slack(self, x_hat, mu):
+        n_constraints = self.count()
+        if n_constraints:
+            wp.launch(update_slack_variables, n_constraints, inputs=[self.hash, x_hat, mu])
 
 
-        # fill in contact information, init with gamma = 1.0, lambda = 0.0
-        wp.launch(register_hash, dim = (n_constraints, ), inputs = [self.hash, constraints])
+class RodComplexAL(RodBCBase, RodComplex, ContactSolverBase):
+    """Barrier-free AL time integrator using the existing Warp contact soup."""
 
-    def copy_from(self, a: ActiveSet):
-
-        if self.contact_volume < a.contact_volume:
-            self.hash = self.reserve(a.contact_volume)
-        
-        wp.copy(self.hash.cell_start, a.hash.cell_start)
-        wp.copy(self.hash.cell_entries, a.hash.cell_entries)
-
-    def merge(self, a: ActiveSet): 
-        new_hash = self.reserve(self.contact_volume)
-
-        n_constraints_old = a.hash.cell_start.numpy()[-1]
-        n_constraints_new = self.hash.cell_start.numpy()[-1]
-
-        wp.launch(count_merge, dim = (n_constraints_old + n_constraints_new, ), inputs = [a.hash, self.hash, new_hash, n_constraints_old, n_constraints_new])
-
-        wp.launch_tiled(tile_scan_inclusive, dim=[], inputs=[new_hash.cell_entries], block_dim=64)
-
-        wp.launch(register_merge, dim = (n_constraints_old + n_constraints_new, ), inputs = [a.hash, self.hash, new_hash, n_constraints_old, n_constraints_new])
-
-        return new_hash
-
-    def update_forces(self, is_pt, mu):
-        n_constraints = self.hash.cell_start.numpy()[-1]
-        wp.launch(update_active_set_forces, dim = (n_constraints, ), inputs = [self.hash, is_pt, mu])   
-        
-@wp.kernel
-def contact_gauss_newton_ee(states: NewtonState, soup: Soup, constraints: wp.array(dtype = ALConstraint), triplets: Triplets, b: wp.array(dtype = vec3), mu: scalar):
-    z = scalar(0.0)
-    i = wp.tid() 
-    c = constraints[i]
-
-    dist_sqr = fetch_dist_squared_ee(soup, c)
-    x0 = states.x[c.a1a2b1b2[0]]
-    x1 = states.x[c.a1a2b1b2[1]]
-    x2 = states.x[c.a1a2b1b2[2]]
-    x3 = states.x[c.a1a2b1b2[3]]
-    grad, hess = edge_edge_distance_gradient_hessian(x0, x1, x2, x3)
-
-    ci = dist_sqr - c.l0 * c.l0
-    si = wp.max(z, ci - c.lam / mu)
-
-    term_hess = mu * c.gamma
-    term = term_hess * (ci - c.lam / mu - si)
-    grad_output *= term
-
-    for ii in range(4): 
-        gii = vec3(grad_output[ii * 3 + 0], grad_output[ii * 3 + 1], grad_output[ii * 3 + 2])
-        wp.atomic_add(b, c.a1a2b1b2[ii], gii)
-        for jj in range(4):
-            triplets.rows[i * 16 + ii * 4 + jj] = c.a1a2b1b2[ii]
-            triplets.cols[i * 16 + ii * 4 + jj] = c.a1a2b1b2[jj]
-            triplets.vals[i * 16 + ii * 4 + jj] = wp.outer(grad[ii], grad[jj]) * term_hess
-    
-class RodComplexAL(RodBCBase, RodComplex, ContactSolverBase): 
-    def __init__(self, h, meshes = [], transforms = [], static_meshes:StaticScene = None):
-        self.meshes_filename = meshes 
-        self.transforms = transforms
+    def __init__(self, h, meshes=None, transforms=None, static_meshes: StaticScene = None):
+        self.meshes_filename = [] if meshes is None else meshes
+        self.transforms = [] if transforms is None else transforms
         RodBCBase.__init__(self, h)
         self.soup.x_transformed = self.states.x
         ContactSolverBase.__init__(self)
-        self.eps = 1e-3
-        self.k_min = 2
-
+        self.termination_tolerance = 1.0e-3
+        self.minimum_outer_iterations = 2
+        self.max_outer_iterations = 100
+        self.max_inner_iterations = 20
         self.x_t = wp.zeros_like(self.states.x)
+        self.x_safe = wp.zeros_like(self.states.x)
         self.x_tilde = wp.zeros_like(self.states.x)
+        self.contact_gradient = wp.zeros_like(self.states.x)
+        self.vertex_toi = wp.ones(self.n_nodes, dtype=scalar)
+        initial_capacity = max(self.contacts_new.capacity, self.contacts_pt.capacity)
+        self.active_set_ee = ActiveSet(initial_capacity)
+        self.active_set_pt = ActiveSet(initial_capacity)
+        self.detected_set_ee = ActiveSet(initial_capacity)
+        self.detected_set_pt = ActiveSet(initial_capacity)
+        self.mu = scalar(1.0)
 
-        n_edges = self.soup.edges.shape[0] // 2
-        n_triangles = self.soup.triangles.shape[0] // 3
-        n_pts = self.n_nodes
-        # fixme: replace it with number of surface nodes
-        contact_volume_ee = self.contacts_new.capacity
-    
-        self.active_set_ee = ActiveSet(n_edges, n_triangles, n_pts, contact_volume_ee)
-
-        self.active_set_pt = ActiveSet(n_edges, n_triangles, n_pts, contact_volume_ee)
-
-        self.active_set_ee_old = ActiveSet(n_edges, n_triangles, n_pts, contact_volume_ee)
-
-        self.active_set_pt_old = ActiveSet(n_edges, n_triangles, n_pts, contact_volume_ee)
+    def _compute_physical_matrix(self):
+        self.compute_K()
+        bsr_axpy(self.M_sparse, self.K_sparse, 1.0, self.h * self.h)
+        self.A = self.K_sparse
 
     def compute_mu(self):
-        return 1.0
-        
+        """Equation 20: mu = 0.1 max_i (nabla^2 E)_ii."""
+        self._compute_physical_matrix()
+        diagonal_max = wp.zeros(1, dtype=scalar)
+        wp.launch(max_diagonal, self.n_nodes, inputs=[self.A.offsets, self.A.columns, self.A.values, diagonal_max])
+        value = float(diagonal_max.numpy()[0])
+        return scalar(max(1.0e-8, float(MU_DIAGONAL_SCALE) * value))
+
     def compute_A(self):
-        super().compute_A()
-        # collision set is the penetrated constraints captured by ccd
+        self._compute_physical_matrix()
+        n_ee = self.active_set_ee.count()
+        n_pt = self.active_set_pt.count()
+        n_contacts = n_ee + n_pt
+        self.contact_gradient.zero_()
         self.collision_triplets = Triplets()
-        nnz = (self.n_contacts + self.n_contacts_pt) * 4 * 4
-        self.collision_triplets.rows = wp.zeros((nnz,), dtype = int)
-        self.collision_triplets.cols = wp.zeros_like(self.collision_triplets.rows)
-        self.collision_triplets.vals = wp.zeros((nnz,), dtype = mat33)
-        nnz = (self.n_contacts + self.n_contacts_pt) * 16 
+        self.collision_triplets.rows = wp.zeros(n_contacts * 16, dtype=int)
+        self.collision_triplets.cols = wp.zeros(n_contacts * 16, dtype=int)
+        self.collision_triplets.vals = wp.zeros(n_contacts * 16, dtype=mat33)
+        if n_ee:
+            wp.launch(contact_gauss_newton_ee, n_ee, inputs=[self.states, self.active_set_ee.hash.cell_entries, self.collision_triplets, self.contact_gradient, self.mu])
+        if n_pt:
+            wp.launch(contact_gauss_newton_pt, n_pt, inputs=[self.states, self.active_set_pt.hash.cell_entries, self.collision_triplets, self.contact_gradient, self.mu, n_ee])
+        if n_contacts:
+            collision_hessian = bsr_from_triplets(self.n_nodes, self.n_nodes, self.collision_triplets.rows, self.collision_triplets.cols, self.collision_triplets.vals)
+            bsr_axpy(collision_hessian, self.A, 1.0, 1.0)
+        wp.launch(eliminate_fixed_dofs, self.n_nodes, inputs=[self.A.offsets, self.A.columns, self.A.values, self.geo.fixed])
 
-        self.mu = self.compute_mu()
-
-        n_contact_ee = self.active_set_ee.hash.cell_start.numpy()[-1]
-        n_contact_pt = self.active_set_pt.hash.cell_start.numpy()[-1]
-
-        wp.launch(contact_gauss_newton_ee, dim = (n_contact_ee, ), inputs = [self.states, self.soup, self.active_set_ee.hash.cell_entries, self.collision_triplets, self.b])
-        wp.launch(contact_gauss_newton_pt, dim = (n_contact_pt, ), inputs = [self.states, self.soup, self.active_set_pt.hash.cell_entries, self.collision_triplets, self.b, n_contact_ee])
-        
+    def compute_rhs(self):
+        wp.launch(compute_rhs_tilde, self.n_nodes, inputs=[self.states, self.x_tilde, self.h, self.M, self.b])
+        array_axpy(self.contact_gradient, self.b, 1.0, 1.0)
+        wp.launch(eliminate_fixed_gradient, self.n_nodes, inputs=[self.b, self.geo.fixed])
 
     def compute_collision_energy(self):
-        pass 
+        energy = wp.zeros(1, dtype=scalar)
+        n_ee = self.active_set_ee.count()
+        n_pt = self.active_set_pt.count()
+        if n_ee:
+            wp.launch(collision_energy_kernel, n_ee, inputs=[self.states.x, self.active_set_ee.hash.cell_entries, self.mu, energy])
+        if n_pt:
+            wp.launch(collision_energy_kernel, n_pt, inputs=[self.states.x, self.active_set_pt.hash.cell_entries, self.mu, energy])
+        return float(energy.numpy()[0])
 
+    def compute_inertia(self):
+        energy = wp.zeros(1, dtype=scalar)
+        wp.launch(compute_inertia_tilde, self.n_nodes, inputs=[self.states, self.geo, self.x_tilde, self.M, energy])
+        return float(energy.numpy()[0])
+
+    def compute_bc_energy(self):
+        return 0.0
+
+    def line_search_upper_bound(self):
+        return 1.0
+
+    def compute_tilde_x(self):
+        wp.copy(self.x_t, self.states.x)
+        wp.copy(self.x_safe, self.states.x)
+        wp.launch(compute_tilde_x_kernel, self.n_nodes, inputs=[self.x_tilde, self.x_t, self.states.xdot, self.h])
+
+    def move_boundary(self):
+        """Move x_hat's fixed vertices to their target without a penalty."""
+        self.attachment_residual.zero_()
+        self.b.zero_()
+        self.compute_compensation()
+        wp.launch(apply_boundary_target, self.n_nodes, inputs=[self.states, self.geo, self.attachment_residual])
+
+    def solve_subproblem(self):
+        """Algorithm 2: alternating slack/Newton solve and multiplier update."""
+        self.active_set_ee.linearize(self.x_safe, False)
+        self.active_set_pt.linearize(self.x_safe, True)
+        for _ in range(self.max_inner_iterations):
+            # Algorithm 2 line 11: update s at the current iterate, then keep
+            # it fixed through this Newton direction and line search.
+            self.active_set_ee.update_slack(self.states.x, self.mu)
+            self.active_set_pt.update_slack(self.states.x, self.mu)
+            self.compute_A()
+            self.compute_rhs()
+            self.solve()
+            step_length = self.line_search()
+            if step_length == 0.0 or step_length >= 1.0 - 1.0e-12:
+                break
+        # Algorithm 2 line 23 recomputes slack at the accepted x_hat before
+        # the multiplier and decay update.
+        self.active_set_ee.update_slack(self.states.x, self.mu)
+        self.active_set_pt.update_slack(self.states.x, self.mu)
+        self.active_set_ee.update_forces(self.states.x, self.mu)
+        self.active_set_pt.update_forces(self.states.x, self.mu)
+
+    def update_active_set(self):
+        """Algorithm 3: add per-vertex earliest CCD pairs and decay old ones."""
+        alpha = self.new_intersections(self.x_safe, self.states.x)
+        self.vertex_toi.fill_(1.0)
+        if self.n_contacts:
+            wp.launch(accumulate_vertex_toi, self.n_contacts, inputs=[self.contacts_new.list, self.vertex_toi])
+        if self.n_contacts_pt:
+            wp.launch(accumulate_vertex_toi, self.n_contacts_pt, inputs=[self.contacts_pt.list, self.vertex_toi])
+        self.detected_set_ee.create_hash(self.contacts_new.list, self.n_contacts, self.vertex_toi)
+        self.detected_set_pt.create_hash(self.contacts_pt.list, self.n_contacts_pt, self.vertex_toi)
+        self.active_set_ee.merge(self.detected_set_ee)
+        self.active_set_pt.merge(self.detected_set_pt)
+        return alpha
 
     def step(self):
-        '''
-        Alg. 1 in [1] 
-        '''
+        """Algorithm 1: cumulative-TOI outer iteration."""
         self.compute_tilde_x()
         self.move_boundary()
-
-        beta = 1.0 
-        iter = 0
-        while beta > self.eps:
-            self.solve_subproblem() 
-            self.update_active_set()
-
-            alpha = self.collision_free_step(self.states.dx)
-
-            wp.launch(add_dx, dim = (self.n_nodes, ), inputs = [self.states, alpha])
-
-            if iter + 1 >= self.k_min:
-                beta *= 1 - alpha 
-
-            iter += 1 
-
-        wp.copy(self.states.x0, self.states.x_t)
+        self.mu = self.compute_mu()
+        beta = 1.0
+        iteration = 0
+        while beta > self.termination_tolerance:
+            if iteration >= self.max_outer_iterations:
+                raise RuntimeError(
+                    f"AL outer solve did not converge: beta={beta:.3e}, "
+                    f"active EE/PT={self.active_set_ee.count()}/{self.active_set_pt.count()}"
+                )
+            self.solve_subproblem()
+            alpha = self.update_active_set()
+            wp.launch(blend_feasible_state, self.n_nodes, inputs=[self.x_safe, self.states.x, alpha])
+            if iteration + 1 >= self.minimum_outer_iterations:
+                beta *= 1.0 - alpha
+            print(
+                f"    AL iter={iteration}, alpha={alpha:.3e}, beta={beta:.3e}, "
+                f"mu={float(self.mu):.3e}, active EE/PT="
+                f"{self.active_set_ee.count()}/{self.active_set_pt.count()}"
+            )
+            iteration += 1
+        wp.copy(self.states.x, self.x_safe)
+        wp.copy(self.states.x0, self.x_t)
         self.update_x0_xdot()
         self.theta += self.h
         self.frame += 1
 
 
-    def compute_tilde_x(self):
-        wp.copy(self.x_t, self.states.x)
-        wp.launch(compute_tilde_x, dim = (self.n_nodes, ), inputs = [self.x_tilde, self.states])
+class RodsTwistAL(RodComplexAL):
+    """Four-rod geometry using the barrier-free AL integrator."""
 
-    def move_boundary(self):
-        pass
+    def __init__(self, timestep=0.025, high_resolution=False):
+        from rods_twist import CONTACT_THICKNESS, LOW_RES_ROD_MESH, PAPER_ROD_MESH
 
-    def solve_subproblem(self):
-        '''
-        Alg. 2 in [1] 
-        '''
-        super().step()
-        # fixme: don't advance self.theta and self.frame
+        self.rod_mesh = PAPER_ROD_MESH if high_resolution else LOW_RES_ROD_MESH
+        if not self.rod_mesh.exists():
+            raise FileNotFoundError(f"Missing {self.rod_mesh}")
+        contact_module._thickness = CONTACT_THICKNESS
+        contact_module.buffer = CONTACT_THICKNESS
+        super().__init__(timestep, meshes=[str(self.rod_mesh)] * 4, transforms=[np.eye(4)] * 4)
 
-        self.active_set_ee.update_forces(False, self.mu)
-        self.active_set_pt.update_forces(True, self.mu)
+    from rods_twist import RodsTwist as _RodsTwistGeometry
 
-    def update_active_set(self):
-        '''
-        Alg. 3 in [1] 
-        '''
-        self.new_intersections(self.states.x0, self.states.x)
+    get_next_object = _RodsTwistGeometry.get_next_object
+    set_fixed_boundary = _RodsTwistGeometry.set_fixed_boundary
+    compute_compensation = _RodsTwistGeometry.compute_compensation
 
-        self.active_set_ee.create_hash(self.contacts_new)
-        self.active_set_pt.create_hash(self.contacts_new)
 
-        self.active_set_ee_old = self.active_set_ee.merge(self.active_set_ee_old)
-        self.active_set_pt_old = self.active_set_pt.merge(self.active_set_pt_old)
+def main():
+    import polyscope as ps
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--high-resolution", action="store_true")
+    parser.add_argument("--headless-steps", type=int, default=1)
+    parser.add_argument("--save-checkpoint", type=Path)
+    args = parser.parse_args()
+    if args.headless_steps < 0:
+        parser.error("--headless-steps must be non-negative")
+    wp.init()
+    simulation = RodsTwistAL(high_resolution=args.high_resolution)
+    ps.init()
+    viewer = PSViewer(simulation)
+    
+    ps.set_ground_plane_mode("none")
+    ps.set_user_callback(viewer.callback)
+    ps.show()
+    # for _ in range(args.headless_steps):
+    #     simulation.step()
+    # if args.save_checkpoint is not None:
+    #     simulation.save_checkpoint(args.save_checkpoint)
 
-        self.active_set_ee.copy_from(self.active_set_ee_old)
-        self.active_set_pt.copy_from(self.active_set_pt_old)
+
+if __name__ == "__main__":
+    main()
