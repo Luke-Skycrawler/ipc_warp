@@ -8,6 +8,8 @@ from ccd.ccd import (
     point_triangle_toi,
     swept_edge_aabbs,
     swept_triangle_aabbs,
+    pt_collision_time,
+    ee_collision_time,
 )
 _thickness = 0.01
 contact_volume = 10000
@@ -180,6 +182,20 @@ def append(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness: fl
         contacts.list[idx].e0e1 = wp.vec2i(ei, ej)
         contacts.htable[h] = idx
 
+@wp.func
+def append_ccd(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness: float, ei: int, ej: int, toi: scalar):
+    '''
+    for edges ei < ej; for point-triangle i, j is the index for point and triangle respectively 
+    '''
+    idx = wp.atomic_add(contacts.cnt, 0, 1)
+    if idx < contacts.capacity:
+        h = _hash(a1, b1)
+        contacts.list[idx].a1a2b1b2 = wp.vec4i(a1, a2, b1, b2)
+        contacts.list[idx].l0 = scalar(thickness * 2.0)
+        contacts.list[idx].alpha = toi
+        contacts.list[idx].e0e1 = wp.vec2i(ei, ej)
+        contacts.htable[h] = idx
+
 @wp.kernel
 def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thickness: float):
     i = wp.tid()
@@ -348,6 +364,81 @@ def compute_normal_kernel(x: wp.array(dtype = vec3), triangles: wp.array(dtype =
 
     N[i] = triangle_normal(x1, x2, x3)
 
+
+@wp.kernel
+def point_triangle_intersections(
+    triangle_bvh: wp.uint64,
+    x0: wp.array(dtype=vec3),
+    x1: wp.array(dtype=vec3),
+    triangles: wp.array(dtype=int),
+    body: wp.array(dtype=int),
+    toi: wp.array(dtype=scalar),
+    padding: scalar,
+    exclude_same_body: bool,
+    contacts: Contacts,
+    thickness: scalar
+):
+    i = wp.tid()
+    p0 = x0[i]
+    p1 = x1[i]
+    query = wp.bvh_query_aabb(
+        triangle_bvh,
+        wp.vec3(wp.min(p0, p1) - vec3(padding)),
+        wp.vec3(wp.max(p0, p1) + vec3(padding)),
+    )
+
+    j = int(0)
+    while wp.bvh_query_next(query, j):
+        t0 = triangles[3 * j]
+        t1 = triangles[3 * j + 1]
+        t2 = triangles[3 * j + 2]
+        connected = i == t0 or i == t1 or i == t2
+        filtered = exclude_same_body and body[i] == body[t0]
+        if not connected and not filtered:
+            # t = conservative_pt_toi(
+            t = pt_collision_time(
+                p0, x0[t0], x0[t1], x0[t2],
+                p1, x1[t0], x1[t1], x1[t2],
+            )
+            if t < scalar(1.0):
+                wp.atomic_min(toi, 0, t)
+                append_ccd(contacts, i, t0, t1, t2, thickness, i, j, t)
+
+@wp.kernel
+def edge_edge_intersections(
+    edge_bvh: wp.uint64,
+    x0: wp.array(dtype=vec3),
+    x1: wp.array(dtype=vec3),
+    edges: wp.array(dtype=int),
+    body: wp.array(dtype=int),
+    lower: wp.array(dtype=wp.vec3),
+    upper: wp.array(dtype=wp.vec3),
+    toi: wp.array(dtype=scalar),
+    exclude_same_body: bool,
+    contacts: Contacts,
+    thickness: scalar
+):
+    i = wp.tid()
+    a0 = edges[2 * i]
+    a1 = edges[2 * i + 1]
+    query = wp.bvh_query_aabb(edge_bvh, lower[i], upper[i])
+
+    j = int(0)
+    while wp.bvh_query_next(query, j):
+        b0 = edges[2 * j]
+        b1 = edges[2 * j + 1]
+        connected = a0 == b0 or a0 == b1 or a1 == b0 or a1 == b1
+        filtered = exclude_same_body and body[a0] == body[b0]
+        if i < j and not connected and not filtered:
+            # t = conservative_ee_toi(
+            t = ee_collision_time(
+                x0[a0], x0[a1], x0[b0], x0[b1],
+                x1[a0], x1[a1], x1[b0], x1[b1],
+            )
+            if t < scalar(1.0):
+                wp.atomic_min(toi, 0, t)
+                append_ccd(contacts, a0, a1, b0, b1, thickness, i, j, t)
+
 class ContactSolverBase:
     def __init__(self):
         '''
@@ -482,7 +573,13 @@ class ContactSolverBase:
         return 0.9 * toi if toi < 1.0 else 1.0
 
     def new_intersections(self, x0, x1):
-        """Return a zero-thickness CCD upper bound for the solver update x -= alpha * dx."""
+        '''
+        Only used for Augmented Lagrangian solver (`augmented_lagrangian.py`) to detect intersections and update active contact set. (Alg. 3)
+        '''
+
+        self.contacts_new.cnt.zero_()
+        self.contacts_new.htable.fill_(-1)
+        
         n_edges = self.soup.edges.shape[0] // 2
         padding = scalar(1e-7)
         
@@ -495,14 +592,19 @@ class ContactSolverBase:
         self.ccd_edge_bvh.refit()
         self.ccd_toi.fill_(1.0)
         wp.launch(
-            edge_edge_toi,
+            edge_edge_intersections,
             n_edges,
             inputs=[self.ccd_edge_bvh.id, x0, x1,
                     self.soup.edges, self.soup.body, self.ccd_edge_lower,
-                    self.ccd_edge_upper, self.ccd_toi, disable_self_collision],
+                    self.ccd_edge_upper, self.ccd_toi, disable_self_collision, self.contacts_new, _thickness],
         )
+        self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
 
         if self.has_triangles:
+
+            self.contacts_pt.cnt.zero_()
+            self.contacts_pt.htable.fill_(-1)
+
             n_triangles = self.soup.triangles.shape[0] // 3
             wp.launch(
                 swept_triangle_aabbs,
@@ -512,12 +614,13 @@ class ContactSolverBase:
             )
             self.ccd_triangle_bvh.refit()
             wp.launch(
-                point_triangle_toi,
+                point_triangle_intersections,
                 self.soup.x_transformed.shape[0],
                 inputs=[self.ccd_triangle_bvh.id, x0, x1,
                         self.soup.triangles, self.soup.body, self.ccd_toi,
-                        padding, disable_self_collision],
+                        padding, disable_self_collision, self.contacts_pt, _thickness],
             )
+            self.n_contacts_pt = int(self.contacts_pt.cnt.numpy()[0]) 
 
         with self.profile_timer("ccd toi host transfer"):
             toi = float(self.ccd_toi.numpy()[0])
@@ -556,7 +659,6 @@ class ContactSolverBase:
                 self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
         if verbose:
             print(f"n ee contacts = {self.n_contacts}")
-        # print(self.contacts.list.numpy()["a1a2b1b2"][:self.n_contacts])
 
         self.contacts_pt.cnt.zero_()
         self.contacts_pt.htable.fill_(-1)
