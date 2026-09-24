@@ -278,6 +278,12 @@ class AffineBodyDynamics(RodComplexBC):
         self._abd_initializing = False
         self._sync_vertices()
         self._prepare_prediction()
+        self._cached_line_search_energy = None
+        self._cached_state_potential_energy = None
+        self._last_evaluated_potential_energy = None
+        self.line_search_energy_cache_hits = 0
+        self.line_search_potential_cache_hits = 0
+        self.line_search_energy_evaluations = 0
 
     # RodBCBase invokes these virtual methods before ABD state exists.
     def define_M(self):
@@ -298,6 +304,8 @@ class AffineBodyDynamics(RodComplexBC):
         wp.copy(self.abd_states.q, self.abd_states.q0)
         self.abd_states.qdot.zero_()
         self.abd_states.dx.zero_()
+        self._cached_line_search_energy = None
+        self._cached_state_potential_energy = None
         self._sync_vertices()
         self.theta = 0.0
         self.frame = 0
@@ -365,6 +373,10 @@ class AffineBodyDynamics(RodComplexBC):
 
     def step(self):
         self._prepare_prediction()
+        # q_tilde changes the inertial energy at the start of every timestep.
+        # Within the Newton solve, however, an accepted E1 is exactly the E0
+        # of the following iteration and can be reused safely.
+        self._cached_line_search_energy = None
         RodBCBase.step(self)
 
     def compute_A(self):
@@ -508,7 +520,22 @@ class AffineBodyDynamics(RodComplexBC):
     def line_search(self):
         with self.profile_timer("line search"):
             q_start = wp.clone(self.abd_states.q)
-            e0 = self.compute_inertia() + self.compute_psi() + self.compute_collision_energy()
+            if self._cached_line_search_energy is None:
+                if self._cached_state_potential_energy is None:
+                    e0 = self._compute_incremental_energy()
+                    e0_potential = self._last_evaluated_potential_energy
+                else:
+                    # Across a timestep boundary q is unchanged, hence contact
+                    # and orthogonality energies are unchanged.  Only q_tilde
+                    # (and therefore inertia) needs to be evaluated again.
+                    inertia, _ = self._energies()
+                    e0_potential = self._cached_state_potential_energy
+                    e0 = inertia + e0_potential
+                    self.line_search_potential_cache_hits += 1
+            else:
+                e0 = self._cached_line_search_energy
+                e0_potential = self._cached_state_potential_energy
+                self.line_search_energy_cache_hits += 1
             upper = self.line_search_upper_bound()
             alpha = upper
             e1 = np.inf
@@ -518,7 +545,8 @@ class AffineBodyDynamics(RodComplexBC):
                 wp.launch(_affine_add_step, self.n_bodies * 4,
                           inputs=[self.abd_states.q, self.abd_states.dx, alpha])
                 self._sync_vertices()
-                e1 = self.compute_inertia() + self.compute_psi() + self.compute_collision_energy()
+                e1 = self._compute_incremental_energy()
+                e1_potential = self._last_evaluated_potential_energy
                 if np.isfinite(e1) and e1 < e0:
                     accepted = True
                     break
@@ -529,8 +557,20 @@ class AffineBodyDynamics(RodComplexBC):
                 wp.copy(self.abd_states.q, q_start)
                 self._sync_vertices()
                 alpha = 0.0
+                self._cached_line_search_energy = e0
+                self._cached_state_potential_energy = e0_potential
+            else:
+                self._cached_line_search_energy = e1
+                self._cached_state_potential_energy = e1_potential
             print(f"    alpha = {alpha:1.2e}, E0 = {e0:1.2e}, E1 = {e1:1.2e}, upper bound = {upper:1.2e}")
             return alpha
+
+    def _compute_incremental_energy(self):
+        self.line_search_energy_evaluations += 1
+        inertia, ortho = self._energies()
+        collision = self.compute_collision_energy()
+        self._last_evaluated_potential_energy = ortho + collision
+        return inertia + self._last_evaluated_potential_energy
 
     def _energies(self):
         with self.profile_timer("ABD body energy"):
@@ -581,7 +621,7 @@ class ScrewSpin(AffineBodyDynamics):
 
 
 class ScrewAndNut(AffineBodyDynamics):
-    def __init__(self, h=0.005, linear_solver=None):
+    def __init__(self, h=0.01, linear_solver=None):
         super().__init__(
             h,
             [SCREW_ASSET_DIR / "screw-big-2.obj", SCREW_ASSET_DIR / "nut-big-2.obj"],

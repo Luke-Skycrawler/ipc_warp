@@ -541,22 +541,26 @@ class ContactSolverBase:
         n_edges = self.soup.edges.shape[0] // 2
         padding = scalar(1e-7)
         with self.profile_timer("CCD edge phase"):
-            wp.launch(_add_dx, self.soup.x_transformed.shape[0], inputs=[self.ccd_x1, self.soup.x_transformed, dx])
-            wp.launch(
-                swept_edge_aabbs,
-                n_edges,
-                inputs=[self.soup.x_transformed, self.ccd_x1, self.soup.edges,
-                        self.ccd_edge_lower, self.ccd_edge_upper, padding],
-            )
-            self.ccd_edge_bvh.refit()
+            with self.profile_timer("CCD vertex prediction"):
+                wp.launch(_add_dx, self.soup.x_transformed.shape[0], inputs=[self.ccd_x1, self.soup.x_transformed, dx])
+            with self.profile_timer("CCD edge swept AABBs"):
+                wp.launch(
+                    swept_edge_aabbs,
+                    n_edges,
+                    inputs=[self.soup.x_transformed, self.ccd_x1, self.soup.edges,
+                            self.ccd_edge_lower, self.ccd_edge_upper, padding],
+                )
+            with self.profile_timer("CCD edge BVH refit"):
+                self.ccd_edge_bvh.refit()
             self.ccd_toi.fill_(1.0)
-            wp.launch(
-                edge_edge_toi,
-                n_edges,
-                inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, self.ccd_x1,
-                        self.soup.edges, self.soup.body, self.ccd_edge_lower,
-                        self.ccd_edge_upper, self.ccd_toi, self.disable_self_collision],
-            )
+            with self.profile_timer("CCD EE query and TOI"):
+                wp.launch(
+                    edge_edge_toi,
+                    n_edges,
+                    inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, self.ccd_x1,
+                            self.soup.edges, self.soup.body, self.ccd_edge_lower,
+                            self.ccd_edge_upper, self.ccd_toi, self.disable_self_collision],
+                )
 
         if self.has_triangles:
             with self.profile_timer("CCD point-triangle phase"):
