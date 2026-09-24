@@ -24,15 +24,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("spin", "nut"), default="nut")
     parser.add_argument("--solver", choices=("cg", "ldlt"), default="cg")
+    parser.add_argument("--dcd", choices=("dynamic", "fixed"), default="dynamic")
     parser.add_argument("--headless-steps", type=int)
     args = parser.parse_args()
 
     wp.init()
-    simulation = (
-        ScrewSpin(linear_solver=args.solver)
-        if args.mode == "spin"
-        else ScrewAndNut(linear_solver=args.solver)
-    )
+    if args.mode == "spin":
+        simulation = ScrewSpin(linear_solver=args.solver)
+    elif args.dcd == "fixed":
+        from fixed_bvh_contacts import FixedBVHScrewAndNut
+        simulation = FixedBVHScrewAndNut(linear_solver=args.solver)
+    else:
+        simulation = ScrewAndNut(linear_solver=args.solver)
 
     if args.headless_steps is not None:
         q_initial = simulation.abd_states.q.numpy().copy()
