@@ -540,39 +540,41 @@ class ContactSolverBase:
         """Return a zero-thickness CCD upper bound for the solver update x -= alpha * dx."""
         n_edges = self.soup.edges.shape[0] // 2
         padding = scalar(1e-7)
-        wp.launch(_add_dx, self.soup.x_transformed.shape[0], inputs=[self.ccd_x1, self.soup.x_transformed, dx])
-        wp.launch(
-            swept_edge_aabbs,
-            n_edges,
-            inputs=[self.soup.x_transformed, self.ccd_x1, self.soup.edges,
-                    self.ccd_edge_lower, self.ccd_edge_upper, padding],
-        )
-        self.ccd_edge_bvh.refit()
-        self.ccd_toi.fill_(1.0)
-        wp.launch(
-            edge_edge_toi,
-            n_edges,
-            inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, self.ccd_x1,
-                    self.soup.edges, self.soup.body, self.ccd_edge_lower,
-                    self.ccd_edge_upper, self.ccd_toi, self.disable_self_collision],
-        )
+        with self.profile_timer("CCD edge phase"):
+            wp.launch(_add_dx, self.soup.x_transformed.shape[0], inputs=[self.ccd_x1, self.soup.x_transformed, dx])
+            wp.launch(
+                swept_edge_aabbs,
+                n_edges,
+                inputs=[self.soup.x_transformed, self.ccd_x1, self.soup.edges,
+                        self.ccd_edge_lower, self.ccd_edge_upper, padding],
+            )
+            self.ccd_edge_bvh.refit()
+            self.ccd_toi.fill_(1.0)
+            wp.launch(
+                edge_edge_toi,
+                n_edges,
+                inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, self.ccd_x1,
+                        self.soup.edges, self.soup.body, self.ccd_edge_lower,
+                        self.ccd_edge_upper, self.ccd_toi, self.disable_self_collision],
+            )
 
         if self.has_triangles:
-            n_triangles = self.soup.triangles.shape[0] // 3
-            wp.launch(
-                swept_triangle_aabbs,
-                n_triangles,
-                inputs=[self.soup.x_transformed, self.ccd_x1, self.soup.triangles,
-                        self.ccd_triangle_lower, self.ccd_triangle_upper, padding],
-            )
-            self.ccd_triangle_bvh.refit()
-            wp.launch(
-                point_triangle_toi,
-                self.soup.x_transformed.shape[0],
-                inputs=[self.ccd_triangle_bvh.id, self.soup.x_transformed, self.ccd_x1,
-                        self.soup.triangles, self.soup.body, self.ccd_toi,
-                        padding, self.disable_self_collision],
-            )
+            with self.profile_timer("CCD point-triangle phase"):
+                n_triangles = self.soup.triangles.shape[0] // 3
+                wp.launch(
+                    swept_triangle_aabbs,
+                    n_triangles,
+                    inputs=[self.soup.x_transformed, self.ccd_x1, self.soup.triangles,
+                            self.ccd_triangle_lower, self.ccd_triangle_upper, padding],
+                )
+                self.ccd_triangle_bvh.refit()
+                wp.launch(
+                    point_triangle_toi,
+                    self.soup.x_transformed.shape[0],
+                    inputs=[self.ccd_triangle_bvh.id, self.soup.x_transformed, self.ccd_x1,
+                            self.soup.triangles, self.soup.body, self.ccd_toi,
+                            padding, self.disable_self_collision],
+                )
 
         with self.profile_timer("ccd toi host transfer"):
             toi = float(self.ccd_toi.numpy()[0])
@@ -680,12 +682,14 @@ class ContactSolverBase:
         
     def detect_collision(self): 
         self.compute_V(ret = False)
-        self.update_bvh()
+        with self.profile_timer("collision BVH refit"):
+            self.update_bvh()
         self.contacts_new.cnt.zero_()
         self.contacts_new.htable.fill_(-1)
         n_edges = self.soup.edges.shape[0] // 2
         
-        wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness, self.disable_self_collision])
+        with self.profile_timer("EE collision query"):
+            wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness, self.disable_self_collision])
         with self.profile_timer("contact count host transfer"):
             self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
         if self.n_contacts > self.contacts_new.capacity:
@@ -701,7 +705,8 @@ class ContactSolverBase:
         self.contacts_pt.htable.fill_(-1)
         n_pts = self.soup.xcs.shape[0]
         if self.has_triangles:
-            wp.launch(point_triangle_collision, n_pts, inputs = [self.tri_mesh.id, self.soup, self.contacts_pt, _thickness, self.disable_self_collision])
+            with self.profile_timer("PT collision query"):
+                wp.launch(point_triangle_collision, n_pts, inputs = [self.tri_mesh.id, self.soup, self.contacts_pt, _thickness, self.disable_self_collision])
 
 
             with self.profile_timer("contact count host transfer"):

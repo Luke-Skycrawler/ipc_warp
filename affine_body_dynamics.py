@@ -17,10 +17,12 @@ import warp as wp
 from warp.optim.linear import cg
 from warp.sparse import bsr_axpy, bsr_from_triplets, bsr_zeros
 
+from dxslv import CUSolverDevice
 from scalar_types import scalar, vec3, mat33
 from fem.fem import Triplets
 from fem.params import NewtonState
-from time_integrator_base import RodBCBase
+import time_integrator_base as time_integrator
+from time_integrator_base import RodBCBase, bsr_to_scalar_csr
 from dynamic_contacts import (
     RodComplexBC,
     contact_hessian_ee,
@@ -218,7 +220,8 @@ class AffineBodyDynamics(RodComplexBC):
     """A clinical ABD specialization of :class:`RodComplexBC`."""
 
     def __init__(self, h, meshes, transforms=None, fixed_bodies=None, density=1000.0,
-                 affine_stiffness=1.0e8, gravity=(0.0, 0.0, 0.0), motors=None):
+                 affine_stiffness=1.0e8, gravity=(0.0, 0.0, 0.0), motors=None,
+                 linear_solver=None):
         self._abd_initializing = True
         self._density = float(density)
         self._fixed_body_spec = set(fixed_bodies or [])
@@ -227,6 +230,7 @@ class AffineBodyDynamics(RodComplexBC):
             transforms = [np.eye(4, dtype=np.float64) for _ in meshes]
         super().__init__(h, list(map(str, meshes)), transforms)
         self.disable_self_collision = True
+        self.linear_solver = linear_solver
 
         world = self.states.x.numpy().astype(np.float64, copy=True)
         body = self.body.numpy().astype(np.int32)
@@ -412,18 +416,94 @@ class AffineBodyDynamics(RodComplexBC):
         # compute_A assembles the reduced incremental-potential gradient.
         self.b = self.reduced_b
 
+    def solve_ldlt(self):
+        """Solve the reduced ABD system with cached symbolic factorization.
+
+        As in ``RodComplexBC``, a new symbolic analysis is only performed when
+        the canonicalized contact block pattern changes.  Otherwise only the
+        numerical values are refactorized.
+        """
+        with self.profile_timer("collision pattern host transfer"):
+            collision_nnz = self.collision_hessian.nnz_sync()
+            collision_offsets = self.collision_hessian.offsets.numpy().copy()
+            collision_columns = self.collision_hessian.columns.numpy()[:collision_nnz].copy()
+
+        previous = self._ldlt_collision_pattern
+        same_collision_pattern = (
+            previous is not None
+            and np.array_equal(collision_offsets, previous[0])
+            and np.array_equal(collision_columns, previous[1])
+        )
+
+        # A.shape is the scalar shape, while A.nrow is the number of mat33
+        # block rows consumed by bsr_to_scalar_csr.
+        n = self.A.shape[0]
+        block_nnz = self.A.nnz_sync()
+        scalar_nnz = block_nnz * 9
+        reuse_symbolic = (
+            self._ldlt_solver is not None
+            and same_collision_pattern
+            and scalar_nnz == self._ldlt_scalar_nnz
+        )
+
+        if not reuse_symbolic:
+            self._ldlt_offsets = wp.empty(n + 1, dtype=int, device=self.A.device)
+            self._ldlt_columns = wp.empty(scalar_nnz, dtype=int, device=self.A.device)
+            self._ldlt_values = wp.empty(scalar_nnz, dtype=scalar, device=self.A.device)
+
+        wp.launch(
+            bsr_to_scalar_csr,
+            dim=n + 1,
+            inputs=[
+                self.A.offsets,
+                self.A.columns,
+                self.A.values,
+                self._ldlt_offsets,
+                self._ldlt_columns,
+                self._ldlt_values,
+                self.A.nrow,
+            ],
+            device=self.A.device,
+        )
+
+        if reuse_symbolic:
+            self._ldlt_solver.refactorize(self._ldlt_values.ptr)
+            self.ldlt_refactorizations += 1
+        else:
+            self._ldlt_solver = CUSolverDevice(
+                self._ldlt_offsets.ptr,
+                self._ldlt_columns.ptr,
+                self._ldlt_values.ptr,
+                n,
+                scalar_nnz,
+            )
+            self._ldlt_solver.analyze_pattern()
+            self._ldlt_solver.factorize()
+            self._ldlt_scalar_nnz = scalar_nnz
+            self.ldlt_symbolic_factorizations += 1
+
+        self._ldlt_collision_pattern = (collision_offsets, collision_columns)
+        self._ldlt_solver.solve(self.reduced_b.ptr, self.abd_states.dx.ptr)
+
     def solve(self):
         with self.profile_timer("solve"):
             self.abd_states.dx.zero_()
-            cg(self.A, self.reduced_b, self.abd_states.dx, tol=1.0e-7, maxiter=100,
-               use_cuda_graph=False)
+            solver = self.linear_solver or time_integrator.solver_choice
+            if solver == "cg":
+                cg(self.A, self.reduced_b, self.abd_states.dx, tol=1.0e-4, maxiter=100,
+                   use_cuda_graph=True)
+            elif solver == "ldlt":
+                self.solve_ldlt()
+            else:
+                raise ValueError(f"Unknown ABD linear solver: {solver!r}")
             wp.launch(_affine_vertex_direction, self.n_nodes,
                       inputs=[self.abd_states.dx, self.xcs, self.body, self.states.dx])
 
     def line_search_upper_bound(self):
-        wp.launch(_affine_vertex_direction, self.n_nodes,
-                  inputs=[self.abd_states.dx, self.xcs, self.body, self.states.dx])
-        return self.collision_free_step(self.states.dx)
+        with self.profile_timer("CCD upper bound"):
+            wp.launch(_affine_vertex_direction, self.n_nodes,
+                      inputs=[self.abd_states.dx, self.xcs, self.body, self.states.dx])
+            return self.collision_free_step(self.states.dx)
 
     def line_search(self):
         with self.profile_timer("line search"):
@@ -453,13 +533,18 @@ class AffineBodyDynamics(RodComplexBC):
             return alpha
 
     def _energies(self):
-        inertia = wp.zeros(1, dtype=scalar)
-        ortho = wp.zeros(1, dtype=scalar)
-        wp.launch(_body_energy, self.n_bodies,
-                  inputs=[self.abd_states, self.abd_mass, self.abd_volume,
-                          self.abd_stiffness, self.abd_fixed, self.h * self.h,
-                          inertia, ortho])
-        return float(inertia.numpy()[0]), float(ortho.numpy()[0])
+        with self.profile_timer("ABD body energy"):
+            inertia = wp.zeros(1, dtype=scalar)
+            ortho = wp.zeros(1, dtype=scalar)
+            wp.launch(_body_energy, self.n_bodies,
+                      inputs=[self.abd_states, self.abd_mass, self.abd_volume,
+                              self.abd_stiffness, self.abd_fixed, self.h * self.h,
+                              inertia, ortho])
+            return float(inertia.numpy()[0]), float(ortho.numpy()[0])
+
+    def compute_collision_energy(self):
+        with self.profile_timer("collision energy"):
+            return super().compute_collision_energy()
 
     def compute_inertia(self):
         return self._energies()[0]
@@ -489,13 +574,14 @@ SCREW_ASSET_DIR = Path(r"D:\ref_repos\warp-ipc\assets\sim_data\trimesh\screw-and
 
 
 class ScrewSpin(AffineBodyDynamics):
-    def __init__(self, h=0.005, angular_velocity=(1.0, 2.0, 3.0)):
-        super().__init__(h, [SCREW_ASSET_DIR / "screw-big-2.obj"], gravity=(0, 0, 0))
+    def __init__(self, h=0.005, angular_velocity=(1.0, 2.0, 3.0), linear_solver=None):
+        super().__init__(h, [SCREW_ASSET_DIR / "screw-big-2.obj"], gravity=(0, 0, 0),
+                         linear_solver=linear_solver)
         self.set_initial_velocity(0, angular=angular_velocity)
 
 
 class ScrewAndNut(AffineBodyDynamics):
-    def __init__(self, h=0.005):
+    def __init__(self, h=0.005, linear_solver=None):
         super().__init__(
             h,
             [SCREW_ASSET_DIR / "screw-big-2.obj", SCREW_ASSET_DIR / "nut-big-2.obj"],
@@ -503,4 +589,5 @@ class ScrewAndNut(AffineBodyDynamics):
             gravity=(0, 0, 0),
             affine_stiffness=1.0e8,
             motors={0: (0.0, -np.pi, 0.0)},
+            linear_solver=linear_solver,
         )

@@ -341,10 +341,12 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
                 bsr_axpy(self.collision_hessian, self.K_sparse, self.h * self.h, 1.0)
 
     def compute_collision_energy(self):
-        self.detect_collision()
-        e = wp.zeros((1,), dtype = scalar)
-        wp.launch(contact_energy_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, e])
-        wp.launch(contact_energy_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, e])
+        with self.profile_timer("collision energy detect"):
+            self.detect_collision()
+        with self.profile_timer("collision energy kernels"):
+            e = wp.zeros((1,), dtype = scalar)
+            wp.launch(contact_energy_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, e])
+            wp.launch(contact_energy_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, e])
         with self.profile_timer("energy host transfer"):
             energy_host = e.numpy()
         return energy_host[0] * self.h * self.h
