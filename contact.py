@@ -197,7 +197,8 @@ def append_ccd(contacts: Contacts, a1: int, a2: int, b1: int, b2: int, thickness
         contacts.htable[h] = idx
 
 @wp.kernel
-def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thickness: float):
+def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thickness: float,
+                        exclude_same_body: bool):
     i = wp.tid()
     if True:
         # edge exists
@@ -214,7 +215,7 @@ def edge_edge_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thicknes
             connected = soup.edges[i * 2] == soup.edges[j * 2] or soup.edges[i * 2] == soup.edges[j * 2 + 1] or soup.edges[i * 2 + 1] == soup.edges[j * 2] or soup.edges[i * 2 + 1] == soup.edges[j * 2 + 1]
 
             self_collision = False
-            if wp.static(disable_self_collision):
+            if exclude_same_body:
                 self_collision = soup.body[a1] == soup.body[soup.edges[j * 2]]
             if i < j and not connected and not self_collision: 
                 b1 = soup.edges[j * 2]
@@ -301,7 +302,8 @@ def closest_point_triangle(
     return ret, type
         
 @wp.kernel
-def point_triangle_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thickness: float):
+def point_triangle_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thickness: float,
+                             exclude_same_body: bool):
     i = wp.tid()
     if True:
         # point not inverted 
@@ -315,7 +317,7 @@ def point_triangle_collision(bvh: wp.uint64, soup: Soup, contacts: Contacts, thi
             connected = soup.triangles[j * 3] == i or soup.triangles[j * 3 + 1] == i or soup.triangles[j * 3 + 2] == i
 
             self_collision = False
-            if wp.static(disable_self_collision):
+            if exclude_same_body:
                 self_collision = soup.body[i] == soup.body[soup.triangles[j * 3]]
             
             if not connected and not self_collision: 
@@ -447,6 +449,10 @@ class ContactSolverBase:
         need to have self.soup: Soup defined prior to calling this constructor
         '''
         self.soup: Soup
+        # ABD/rigid meshes must not collide with their own surface.  Keep this
+        # per solver so enabling it does not change deformable simulations or
+        # force a different compile-time specialization of the kernels.
+        self.disable_self_collision = disable_self_collision
 
         n_edges = self.soup.edges.shape[0] // 2
         n_nodes = self.soup.xcs.shape[0]
@@ -548,7 +554,7 @@ class ContactSolverBase:
             n_edges,
             inputs=[self.ccd_edge_bvh.id, self.soup.x_transformed, self.ccd_x1,
                     self.soup.edges, self.soup.body, self.ccd_edge_lower,
-                    self.ccd_edge_upper, self.ccd_toi, disable_self_collision],
+                    self.ccd_edge_upper, self.ccd_toi, self.disable_self_collision],
         )
 
         if self.has_triangles:
@@ -565,7 +571,7 @@ class ContactSolverBase:
                 self.soup.x_transformed.shape[0],
                 inputs=[self.ccd_triangle_bvh.id, self.soup.x_transformed, self.ccd_x1,
                         self.soup.triangles, self.soup.body, self.ccd_toi,
-                        padding, disable_self_collision],
+                        padding, self.disable_self_collision],
             )
 
         with self.profile_timer("ccd toi host transfer"):
@@ -596,7 +602,7 @@ class ContactSolverBase:
             n_edges,
             inputs=[self.ccd_edge_bvh.id, x0, x1,
                     self.soup.edges, self.soup.body, self.ccd_edge_lower,
-                    self.ccd_edge_upper, self.ccd_toi, disable_self_collision, self.contacts_new, _thickness],
+                    self.ccd_edge_upper, self.ccd_toi, self.disable_self_collision, self.contacts_new, _thickness],
         )
         self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
         if self.n_contacts > self.contacts_new.capacity:
@@ -610,7 +616,7 @@ class ContactSolverBase:
                 inputs=[self.ccd_edge_bvh.id, x0, x1,
                         self.soup.edges, self.soup.body, self.ccd_edge_lower,
                         self.ccd_edge_upper, self.ccd_toi,
-                        disable_self_collision, self.contacts_new, _thickness],
+                        self.disable_self_collision, self.contacts_new, _thickness],
             )
             self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
 
@@ -632,7 +638,7 @@ class ContactSolverBase:
                 self.soup.x_transformed.shape[0],
                 inputs=[self.ccd_triangle_bvh.id, x0, x1,
                         self.soup.triangles, self.soup.body, self.ccd_toi,
-                        padding, disable_self_collision, self.contacts_pt, _thickness],
+                        padding, self.disable_self_collision, self.contacts_pt, _thickness],
             )
             self.n_contacts_pt = int(self.contacts_pt.cnt.numpy()[0]) 
             if self.n_contacts_pt > self.contacts_pt.capacity:
@@ -646,7 +652,7 @@ class ContactSolverBase:
                     self.soup.x_transformed.shape[0],
                     inputs=[self.ccd_triangle_bvh.id, x0, x1,
                             self.soup.triangles, self.soup.body, self.ccd_toi,
-                            padding, disable_self_collision, self.contacts_pt,
+                            padding, self.disable_self_collision, self.contacts_pt,
                             _thickness],
                 )
                 self.n_contacts_pt = int(self.contacts_pt.cnt.numpy()[0])
@@ -679,13 +685,13 @@ class ContactSolverBase:
         self.contacts_new.htable.fill_(-1)
         n_edges = self.soup.edges.shape[0] // 2
         
-        wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness])
+        wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness, self.disable_self_collision])
         with self.profile_timer("contact count host transfer"):
             self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
         if self.n_contacts > self.contacts_new.capacity:
             self._grow_contact_list(self.contacts_new, self.n_contacts)
             self.contacts_new.cnt.zero_()
-            wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness])
+            wp.launch(edge_edge_collision, n_edges, inputs = [self.bvh_edges.id, self.soup, self.contacts_new, _thickness, self.disable_self_collision])
             with self.profile_timer("contact count host transfer"):
                 self.n_contacts = int(self.contacts_new.cnt.numpy()[0])
         if verbose:
@@ -695,7 +701,7 @@ class ContactSolverBase:
         self.contacts_pt.htable.fill_(-1)
         n_pts = self.soup.xcs.shape[0]
         if self.has_triangles:
-            wp.launch(point_triangle_collision, n_pts, inputs = [self.tri_mesh.id, self.soup, self.contacts_pt, _thickness])
+            wp.launch(point_triangle_collision, n_pts, inputs = [self.tri_mesh.id, self.soup, self.contacts_pt, _thickness, self.disable_self_collision])
 
 
             with self.profile_timer("contact count host transfer"):
@@ -703,7 +709,7 @@ class ContactSolverBase:
             if self.n_contacts_pt > self.contacts_pt.capacity:
                 self._grow_contact_list(self.contacts_pt, self.n_contacts_pt, point_triangle=True)
                 self.contacts_pt.cnt.zero_()
-                wp.launch(point_triangle_collision, n_pts, inputs = [self.tri_mesh.id, self.soup, self.contacts_pt, _thickness])
+                wp.launch(point_triangle_collision, n_pts, inputs = [self.tri_mesh.id, self.soup, self.contacts_pt, _thickness, self.disable_self_collision])
                 with self.profile_timer("contact count host transfer"):
                     self.n_contacts_pt = int(self.contacts_pt.cnt.numpy()[0])
             if verbose:

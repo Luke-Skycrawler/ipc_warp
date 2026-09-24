@@ -6,7 +6,9 @@ from geometry.static_scene import StaticScene
 
 class PSViewer:
     def __init__(self, rod, static_mesh: StaticScene = None):
-        self.V = rod.xcs.numpy()
+        # ``xcs`` is a material/rest coordinate for affine bodies; the
+        # current world-space surface is always exposed through states.x.
+        self.V = rod.states.x.numpy()
         self.F = rod.F
 
         self.ps_mesh = ps.register_surface_mesh("rod", self.V, self.F)
