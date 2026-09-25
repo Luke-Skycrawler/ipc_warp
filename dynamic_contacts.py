@@ -4,10 +4,15 @@ from fem.interface import RodComplex
 from geometry.static_scene import StaticScene
 from scalar_types import *
 from contact import ContactSolverBase, XConstraint, fetch_dist_v0v1, fetch_dist_v0v1_pt, closest_point_triangle
-from ipctkwp.distance.edge_edge import x_to_grad_psd_hess_ee
-from ipctkwp.distance.point_triangle import x_to_grad_psd_hess_pt
+from ipctkwp.distance.edge_edge import x_to_grad_nsd_hess_ee
+from ipctkwp.distance.point_triangle import x_to_grad_nsd_hess_pt
 from ipctkwp.distance.barrier import ipc_barrier, ipc_barrier_derivative, ipc_barrier_derivative2
-from ipctkwp.distance.mollifier import ee_mollifier_derivatives, ee_mollifier_value, ee_mollifier_threshold
+from ipctkwp.distance.mollifier import (
+    ee_mollifier_gradient_hessian_psd,
+    ee_mollifier_value,
+    ee_mollifier_threshold,
+)
+from ipctkwp.distance.point_edge import point_edge_distance_gradient_nsd_hessian
 from fem.geometry import Soup
 from time_integrator_base import *
 
@@ -19,46 +24,25 @@ def embed_point_point_distance(x0: vec3, x1: vec3, o0: int, o1: int):
     for i in range(3):
         grad[o0 * 3 + i] = scalar(2.0) * d[i]
         grad[o1 * 3 + i] = scalar(-2.0) * d[i]
-        hess[o0 * 3 + i, o0 * 3 + i] = scalar(2.0)
-        hess[o0 * 3 + i, o1 * 3 + i] = scalar(-2.0)
-        hess[o1 * 3 + i, o0 * 3 + i] = scalar(-2.0)
-        hess[o1 * 3 + i, o1 * 3 + i] = scalar(2.0)
+        # The point-point squared-distance Hessian is PSD, so its negative
+        # spectral part is zero.
     return grad, hess
 
 @wp.func
 def embed_point_edge_distance(p: vec3, e0: vec3, e1: vec3, op: int, oe0: int, oe1: int):
-    edge = e1 - e0
-    r = p - e0
-    inv_edge_len2 = scalar(1.0) / wp.dot(edge, edge)
-    alpha = wp.dot(r, edge) * inv_edge_len2
-    q = r - alpha * edge
-    coefficients = vec3(scalar(1.0), alpha - scalar(1.0), -alpha)
-    alpha_signs = vec3(scalar(0.0), scalar(1.0), scalar(-1.0))
-    two_alpha_edge = scalar(2.0) * alpha * edge
-    alpha_grad = wp.matrix_from_rows(
-        edge * inv_edge_len2,
-        (two_alpha_edge - r - edge) * inv_edge_len2,
-        (r - two_alpha_edge) * inv_edge_len2,
-    )
+    grad_pe, hess_pe = point_edge_distance_gradient_nsd_hessian(p, e0, e1)
     offsets = wp.vec3i(op, oe0, oe1)
     grad = vec12()
     hess = mat12()
     for i in range(3):
         oi = offsets[i]
         for k in range(3):
-            grad[oi * 3 + k] = scalar(2.0) * coefficients[i] * q[k]
+            grad[oi * 3 + k] = grad_pe[i, k]
         for j in range(3):
             oj = offsets[j]
-            block = scalar(2.0) * wp.outer(
-                alpha_signs[i] * q - coefficients[i] * edge,
-                alpha_grad[j],
-            )
             for k in range(3):
                 for l in range(3):
-                    value = block[k, l]
-                    if k == l:
-                        value += scalar(2.0) * coefficients[i] * coefficients[j]
-                    hess[oi * 3 + k, oj * 3 + l] = value
+                    hess[oi * 3 + k, oj * 3 + l] = hess_pe[i * 3 + k, j * 3 + l]
     return grad, hess
 
 @wp.func
@@ -99,7 +83,7 @@ def edge_edge_distance_gradient_hessian(x0: vec3, x1: vec3, x2: vec3, x3: vec3):
             pb = x3
         return embed_point_edge_distance(pb, x0, x1, ob, 0, 1)
 
-    return x_to_grad_psd_hess_ee(x0, x1, x2, x3)
+    return x_to_grad_nsd_hess_ee(x0, x1, x2, x3)
 
 @wp.func
 def point_triangle_distance_gradient_hessian(x0: vec3, x1: vec3, x2: vec3, x3: vec3):
@@ -116,7 +100,7 @@ def point_triangle_distance_gradient_hessian(x0: vec3, x1: vec3, x2: vec3, x3: v
         return embed_point_edge_distance(x0, x1, x3, 0, 1, 3)
     if feature == 5:
         return embed_point_edge_distance(x0, x2, x3, 0, 2, 3)
-    return x_to_grad_psd_hess_pt(x0, x1, x2, x3)
+    return x_to_grad_nsd_hess_pt(x0, x1, x2, x3)
 
 
 @wp.func
@@ -128,82 +112,18 @@ def ee_mollifier_threshold_rest(soup: Soup, c: XConstraint):
     return ee_mollifier_threshold(soup.xcs[i0], soup.xcs[i1], soup.xcs[i2], soup.xcs[i3])
 
 @wp.func
-def project_spd_12(hess: mat12):
-    # Cyclic Jacobi EVD, matching warp-ipc's numerical PSD projection.
-    A = hess
-    V = mat12()
-    eigenvalues = vec12()
-    accumulated = vec12()
-    corrections = vec12()
-    for i in range(12):
-        V[i, i] = scalar(1.0)
-        eigenvalues[i] = A[i, i]
-        accumulated[i] = eigenvalues[i]
-
-    sweep = int(0)
-    while sweep < 4:
-        threshold = scalar(0.0)
-        for j in range(12):
-            for i in range(j):
-                threshold += A[i, j] * A[i, j]
-        threshold = wp.sqrt(threshold) / scalar(48.0)
-        if threshold == scalar(0.0):
-            sweep = 4
-        else:
-            for p in range(12):
-                for q in range(p + 1, 12):
-                    gap = scalar(10.0) * wp.abs(A[p, q])
-                    if threshold <= wp.abs(A[p, q]):
-                        delta = eigenvalues[q] - eigenvalues[p]
-                        t = scalar(0.0)
-                        if wp.abs(delta) + gap == wp.abs(delta):
-                            t = A[p, q] / delta
-                        else:
-                            theta = scalar(0.5) * delta / A[p, q]
-                            t = scalar(1.0) / (wp.abs(theta) + wp.sqrt(scalar(1.0) + theta * theta))
-                            if theta < scalar(0.0):
-                                t = -t
-                        c = scalar(1.0) / wp.sqrt(scalar(1.0) + t * t)
-                        s = t * c
-                        tau = s / (scalar(1.0) + c)
-                        rotation = t * A[p, q]
-                        corrections[p] -= rotation
-                        corrections[q] += rotation
-                        eigenvalues[p] -= rotation
-                        eigenvalues[q] += rotation
-                        A[p, q] = scalar(0.0)
-                        for j in range(p):
-                            g = A[j, p]
-                            h = A[j, q]
-                            A[j, p] = g - s * (h + g * tau)
-                            A[j, q] = h + s * (g - h * tau)
-                        for j in range(p + 1, q):
-                            g = A[p, j]
-                            h = A[j, q]
-                            A[p, j] = g - s * (h + g * tau)
-                            A[j, q] = h + s * (g - h * tau)
-                        for j in range(q + 1, 12):
-                            g = A[p, j]
-                            h = A[q, j]
-                            A[p, j] = g - s * (h + g * tau)
-                            A[q, j] = h + s * (g - h * tau)
-                        for j in range(12):
-                            g = V[j, p]
-                            h = V[j, q]
-                            V[j, p] = g - s * (h + g * tau)
-                            V[j, q] = h + s * (g - h * tau)
-            for i in range(12):
-                accumulated[i] += corrections[i]
-                eigenvalues[i] = accumulated[i]
-                corrections[i] = scalar(0.0)
-            sweep += 1
-
+def symmetric_outer_product_psd_12(u: vec12, v: vec12):
+    """Positive spectral part of u v^T + v u^T (rank at most one)."""
     result = mat12()
-    for k in range(12):
-        eigenvalue = wp.max(eigenvalues[k], scalar(0.0))
+    u_norm = wp.sqrt(wp.dot(u, u))
+    v_norm = wp.sqrt(wp.dot(v, v))
+    norm_product = u_norm * v_norm
+    if norm_product > scalar(1.0e-30):
+        w = v_norm * u + u_norm * v
+        scale = scalar(0.5) / norm_product
         for i in range(12):
             for j in range(12):
-                result[i, j] += eigenvalue * V[i, k] * V[j, k]
+                result[i, j] = scale * w[i] * w[j]
     return result
 
 @wp.kernel
@@ -224,16 +144,15 @@ def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         barrier_grad = ipc_barrier_derivative(d2, d02, contact_stiffness)
         barrier_hess = ipc_barrier_derivative2(d2, d02, contact_stiffness)
         eps_x = ee_mollifier_threshold_rest(soup, c)
-        mollifier, mollifier_grad, mollifier_hess = ee_mollifier_derivatives(
+        mollifier = ee_mollifier_value(x0, x1, x2, x3, eps_x)
+        mollifier_grad, mollifier_hess = ee_mollifier_gradient_hessian_psd(
             x0, x1, x2, x3, eps_x
         )
         barrier = ipc_barrier(d2, d02, contact_stiffness)
         barrier_grad_vec = barrier_grad * grad
         hess = mollifier * (barrier_hess * wp.outer(grad, grad) + barrier_grad * hess)
         hess += barrier * mollifier_hess
-        hess += wp.outer(mollifier_grad, barrier_grad_vec)
-        hess += wp.outer(barrier_grad_vec, mollifier_grad)
-        hess = project_spd_12(hess)
+        hess += symmetric_outer_product_psd_12(mollifier_grad, barrier_grad_vec)
         # self.b stores force; compute_rhs later converts it to an energy gradient.
         grad = -(mollifier * barrier_grad_vec + barrier * mollifier_grad)
 
@@ -272,7 +191,6 @@ def contact_hessian_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         barrier_grad = ipc_barrier_derivative(d2, d02, contact_stiffness)
         barrier_hess = ipc_barrier_derivative2(d2, d02, contact_stiffness)
         hess = barrier_hess * wp.outer(grad, grad) + barrier_grad * hess
-        hess = project_spd_12(hess)
         # self.b stores force; compute_rhs later converts it to an energy gradient.
         grad *= -barrier_grad
 
