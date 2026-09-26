@@ -230,6 +230,8 @@ class RodBCBase:
         self.profile_print = True
         self.profile_synchronize = True
         self.profile_timings = {}
+        self.max_newton_iterations = 100
+        self.velocity_tolerance = vel_tol
         print(f"timestep set to {h}")
 
     def configure_profiling(self, enabled=True, print_timings=True, synchronize=True):
@@ -371,7 +373,7 @@ class RodBCBase:
     def step(self):
         newton_iter = True
         n_iter = 0
-        max_iter = 100
+        max_iter = self.max_newton_iterations
         # while n_iter < max_iter:
         while newton_iter and n_iter < max_iter:
             with self.profile_timer("total newton iteration"):
@@ -389,7 +391,7 @@ class RodBCBase:
                 with self.profile_timer("dx host transfer"):
                     dxnp = self.states.dx.numpy()
                 norm_dx = np.max(np.abs(dxnp))
-                newton_iter = norm_dx > vel_tol * self.h
+                newton_iter = norm_dx > self.velocity_tolerance * self.h
                 print(f"    norm = {norm_dx:1.2e}, iter = {n_iter}")
                 n_iter += 1
         self.update_x0_xdot()

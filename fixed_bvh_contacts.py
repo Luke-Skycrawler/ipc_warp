@@ -10,7 +10,7 @@ compact candidate array.
 import numpy as np
 import warp as wp
 
-from scalar_types import scalar, vec3
+from scalar_types import scalar, vec3, mat33
 from contact import (
     ContactSolverBase,
     Contacts,
@@ -22,7 +22,11 @@ from contact import (
     verbose,
 )
 from ccd.ccd import ee_collision_time, pt_collision_time
-from affine_body_dynamics import AffineBodyDynamics, SCREW_ASSET_DIR
+from affine_body_dynamics import (
+    AffineBodyDynamics,
+    SCREW_ASSET_DIR,
+    wrecking_balls_scene_args,
+)
 
 
 @wp.func
@@ -32,7 +36,7 @@ def _body_affine(q: wp.array(dtype=vec3), body: int):
 
 
 @wp.func
-def _inverse_padding(inv_a: wp.mat33d, world_padding: scalar):
+def _inverse_padding(inv_a: mat33, world_padding: scalar):
     norm2 = scalar(0.0)
     for i in range(3):
         for j in range(3):
@@ -61,6 +65,57 @@ def affine_body_aabbs(
     )
     world_lower[b] = world_center - world_extent
     world_upper[b] = world_center + world_extent
+
+
+@wp.func
+def _aabbs_overlap(a_lower: vec3, a_upper: vec3,
+                   b_lower: vec3, b_upper: vec3, padding: scalar):
+    return (
+        a_lower[0] - padding <= b_upper[0]
+        and b_lower[0] - padding <= a_upper[0]
+        and a_lower[1] - padding <= b_upper[1]
+        and b_lower[1] - padding <= a_upper[1]
+        and a_lower[2] - padding <= b_upper[2]
+        and b_lower[2] - padding <= a_upper[2]
+    )
+
+
+@wp.kernel
+def compact_overlapping_body_pairs(
+    lower: wp.array(dtype=vec3), upper: wp.array(dtype=vec3),
+    padding: scalar, pairs: wp.array(dtype=wp.vec2i), count: wp.array(dtype=int),
+):
+    a, b = wp.tid()
+    if a < b and _aabbs_overlap(lower[a], upper[a], lower[b], upper[b], padding):
+        output = wp.atomic_add(count, 0, 1)
+        pairs[output] = wp.vec2i(a, b)
+
+
+BODY_PAIR_TILE = 32
+
+
+@wp.kernel
+def compact_overlapping_body_pairs_tiled(
+    lower: wp.array(dtype=vec3), upper: wp.array(dtype=vec3), n_bodies: int,
+    padding: scalar, pairs: wp.array(dtype=wp.vec2i), count: wp.array(dtype=int),
+):
+    block_a, block_b, lane = wp.tid()
+    a = block_a * BODY_PAIR_TILE + lane
+    b_lower = wp.tile_load(
+        lower, shape=BODY_PAIR_TILE, offset=block_b * BODY_PAIR_TILE, storage="shared"
+    )
+    b_upper = wp.tile_load(
+        upper, shape=BODY_PAIR_TILE, offset=block_b * BODY_PAIR_TILE, storage="shared"
+    )
+    if a < n_bodies:
+        a_lower = lower[a]
+        a_upper = upper[a]
+        for j in range(BODY_PAIR_TILE):
+            b = block_b * BODY_PAIR_TILE + j
+            if b < n_bodies and a < b:
+                if _aabbs_overlap(a_lower, a_upper, b_lower[j], b_upper[j], padding):
+                    output = wp.atomic_add(count, 0, 1)
+                    pairs[output] = wp.vec2i(a, b)
 
 
 @wp.func
@@ -145,95 +200,74 @@ def _swept_edge_query_bounds(
 
 
 @wp.kernel
-def count_fixed_bvh_ee_ccd_candidates(
-    target_bvh: wp.uint64,
-    source_edge_ids: wp.array(dtype=int), target_body: int,
+def batched_fixed_bvh_edge_edge_toi(
+    pairs: wp.array(dtype=wp.vec2i), fixed: wp.array(dtype=int),
+    body_edge_offsets: wp.array(dtype=int), edge_ids: wp.array(dtype=int),
+    edge_bvh_ids: wp.array(dtype=wp.uint64),
     q: wp.array(dtype=vec3), dq: wp.array(dtype=vec3),
     x0: wp.array(dtype=vec3), x1: wp.array(dtype=vec3),
-    edges: wp.array(dtype=int),
-    local_lower: wp.array(dtype=vec3), local_upper: wp.array(dtype=vec3),
-    padding: scalar, counts: wp.array(dtype=int),
-):
-    k = wp.tid()
-    lower, upper = _swept_edge_query_bounds(
-        source_edge_ids[k], target_body, q, dq, x0, x1, edges,
-        local_lower, local_upper, padding,
-    )
-    query = wp.bvh_query_aabb(target_bvh, wp.vec3(lower), wp.vec3(upper))
-    local_id = int(0)
-    count = int(0)
-    while wp.bvh_query_next(query, local_id):
-        count += 1
-    counts[k] = count
-
-
-@wp.kernel
-def write_fixed_bvh_ee_ccd_candidates(
-    target_bvh: wp.uint64,
-    source_edge_ids: wp.array(dtype=int), target_edge_ids: wp.array(dtype=int),
-    target_body: int,
-    q: wp.array(dtype=vec3), dq: wp.array(dtype=vec3),
-    x0: wp.array(dtype=vec3), x1: wp.array(dtype=vec3),
-    edges: wp.array(dtype=int),
-    local_lower: wp.array(dtype=vec3), local_upper: wp.array(dtype=vec3),
-    padding: scalar, offsets: wp.array(dtype=int),
-    pairs: wp.array(dtype=wp.vec2i),
-):
-    k = wp.tid()
-    lower, upper = _swept_edge_query_bounds(
-        source_edge_ids[k], target_body, q, dq, x0, x1, edges,
-        local_lower, local_upper, padding,
-    )
-    query = wp.bvh_query_aabb(target_bvh, wp.vec3(lower), wp.vec3(upper))
-    local_id = int(0)
-    count = int(0)
-    while wp.bvh_query_next(query, local_id):
-        pairs[offsets[k] + count] = wp.vec2i(source_edge_ids[k], target_edge_ids[local_id])
-        count += 1
-
-
-@wp.kernel
-def scanned_total(counts: wp.array(dtype=int), offsets: wp.array(dtype=int), total: wp.array(dtype=int)):
-    n = counts.shape[0]
-    if n == 0:
-        total[0] = 0
-    else:
-        total[0] = offsets[n - 1] + counts[n - 1]
-
-
-@wp.kernel
-def compact_ee_polynomial_toi(
-    x0: wp.array(dtype=vec3), x1: wp.array(dtype=vec3),
-    edges: wp.array(dtype=int), pairs: wp.array(dtype=wp.vec2i),
+    edges: wp.array(dtype=int), local_lower: wp.array(dtype=vec3),
+    local_upper: wp.array(dtype=vec3), padding: scalar,
     toi: wp.array(dtype=scalar),
 ):
-    k = wp.tid()
-    pair = pairs[k]
-    a0 = edges[2 * pair[0]]
-    a1 = edges[2 * pair[0] + 1]
-    b0 = edges[2 * pair[1]]
-    b1 = edges[2 * pair[1] + 1]
-    t = ee_collision_time(
-        x0[a0], x0[a1], x0[b0], x0[b1],
-        x1[a0], x1[a1], x1[b0], x1[b1],
+    pair_index, local_source = wp.tid()
+    pair = pairs[pair_index]
+    source_body = pair[0]
+    target_body = pair[1]
+    if fixed[source_body] != 0 and fixed[target_body] == 0:
+        source_body = pair[1]
+        target_body = pair[0]
+    source_begin = body_edge_offsets[source_body]
+    source_count = body_edge_offsets[source_body + 1] - source_begin
+    if local_source >= source_count:
+        return
+
+    source_edge = edge_ids[source_begin + local_source]
+    lower, upper = _swept_edge_query_bounds(
+        source_edge, target_body, q, dq, x0, x1, edges,
+        local_lower, local_upper, padding,
     )
-    if t < scalar(1.0):
-        wp.atomic_min(toi, 0, t)
+    query = wp.bvh_query_aabb(
+        edge_bvh_ids[target_body], wp.vec3(lower), wp.vec3(upper)
+    )
+    target_begin = body_edge_offsets[target_body]
+    local_id = int(0)
+    while wp.bvh_query_next(query, local_id):
+        target_edge = edge_ids[target_begin + local_id]
+        a0 = edges[2 * source_edge]
+        a1 = edges[2 * source_edge + 1]
+        b0 = edges[2 * target_edge]
+        b1 = edges[2 * target_edge + 1]
+        t = ee_collision_time(
+            x0[a0], x0[a1], x0[b0], x0[b1],
+            x1[a0], x1[a1], x1[b0], x1[b1],
+        )
+        if t < scalar(1.0):
+            wp.atomic_min(toi, 0, t)
 
 
 @wp.kernel
-def fixed_bvh_point_triangle_toi(
-    target_bvh: wp.uint64,
-    source_vertex_ids: wp.array(dtype=int), target_triangle_ids: wp.array(dtype=int),
-    target_body: int,
+def batched_fixed_bvh_point_triangle_toi(
+    pairs: wp.array(dtype=wp.vec2i),
+    body_vertex_offsets: wp.array(dtype=int), vertex_ids: wp.array(dtype=int),
+    body_triangle_offsets: wp.array(dtype=int), triangle_ids: wp.array(dtype=int),
+    triangle_bvh_ids: wp.array(dtype=wp.uint64),
     q: wp.array(dtype=vec3), dq: wp.array(dtype=vec3),
     x0: wp.array(dtype=vec3), x1: wp.array(dtype=vec3),
-    triangles: wp.array(dtype=int),
-    local_lower: wp.array(dtype=vec3), local_upper: wp.array(dtype=vec3),
-    padding: scalar, toi: wp.array(dtype=scalar),
+    triangles: wp.array(dtype=int), local_lower: wp.array(dtype=vec3),
+    local_upper: wp.array(dtype=vec3), padding: scalar,
+    toi: wp.array(dtype=scalar),
 ):
-    k = wp.tid()
-    point = source_vertex_ids[k]
+    pair_index, local_source, direction = wp.tid()
+    pair = pairs[pair_index]
+    source_body = pair[direction]
+    target_body = pair[1 - direction]
+    source_begin = body_vertex_offsets[source_body]
+    source_count = body_vertex_offsets[source_body + 1] - source_begin
+    if local_source >= source_count:
+        return
+
+    point = vertex_ids[source_begin + local_source]
     target_p0 = q[target_body * 4]
     inv_a0 = wp.inverse(_body_affine(q, target_body))
     p0_local = inv_a0 @ (x0[point] - target_p0)
@@ -243,13 +277,14 @@ def fixed_bvh_point_triangle_toi(
     )
     inflate = motion + vec3(_inverse_padding(inv_a0, padding))
     query = wp.bvh_query_aabb(
-        target_bvh,
+        triangle_bvh_ids[target_body],
         wp.vec3(wp.min(p0_local, p1_local) - inflate),
         wp.vec3(wp.max(p0_local, p1_local) + inflate),
     )
+    target_begin = body_triangle_offsets[target_body]
     local_id = int(0)
     while wp.bvh_query_next(query, local_id):
-        triangle = target_triangle_ids[local_id]
+        triangle = triangle_ids[target_begin + local_id]
         t0 = triangles[3 * triangle]
         t1 = triangles[3 * triangle + 1]
         t2 = triangles[3 * triangle + 2]
@@ -262,21 +297,24 @@ def fixed_bvh_point_triangle_toi(
 
 
 @wp.kernel
-def fixed_bvh_edge_edge_query(
-    target_bvh: wp.uint64,
-    source_edge_ids: wp.array(dtype=int),
-    target_edge_ids: wp.array(dtype=int),
-    target_body: int,
-    q: wp.array(dtype=vec3),
-    soup: Soup,
-    contacts: Contacts,
-    thickness: float,
+def batched_fixed_bvh_edge_edge_query(
+    pairs: wp.array(dtype=wp.vec2i),
+    body_edge_offsets: wp.array(dtype=int), edge_ids: wp.array(dtype=int),
+    edge_bvh_ids: wp.array(dtype=wp.uint64), q: wp.array(dtype=vec3),
+    soup: Soup, contacts: Contacts, thickness: float,
 ):
-    k = wp.tid()
-    source_edge = source_edge_ids[k]
+    pair_index, local_source = wp.tid()
+    pair = pairs[pair_index]
+    source_body = pair[0]
+    target_body = pair[1]
+    source_begin = body_edge_offsets[source_body]
+    source_count = body_edge_offsets[source_body + 1] - source_begin
+    if local_source >= source_count:
+        return
+
+    source_edge = edge_ids[source_begin + local_source]
     a0 = soup.edges[2 * source_edge]
     a1 = soup.edges[2 * source_edge + 1]
-
     target_a = _body_affine(q, target_body)
     target_inv = wp.inverse(target_a)
     target_p = q[target_body * 4]
@@ -284,14 +322,14 @@ def fixed_bvh_edge_edge_query(
     p1 = target_inv @ (soup.x_transformed[a1] - target_p)
     padding = _inverse_padding(target_inv, scalar(2.0) * scalar(thickness))
     query = wp.bvh_query_aabb(
-        target_bvh,
+        edge_bvh_ids[target_body],
         wp.vec3(wp.min(p0, p1) - vec3(padding)),
         wp.vec3(wp.max(p0, p1) + vec3(padding)),
     )
-
+    target_begin = body_edge_offsets[target_body]
     local_id = int(0)
     while wp.bvh_query_next(query, local_id):
-        target_edge = target_edge_ids[local_id]
+        target_edge = edge_ids[target_begin + local_id]
         b0 = soup.edges[2 * target_edge]
         b1 = soup.edges[2 * target_edge + 1]
         result = wp.closest_point_edge_edge(
@@ -304,32 +342,37 @@ def fixed_bvh_edge_edge_query(
 
 
 @wp.kernel
-def fixed_bvh_point_triangle_query(
-    target_bvh: wp.uint64,
-    source_vertex_ids: wp.array(dtype=int),
-    target_triangle_ids: wp.array(dtype=int),
-    target_body: int,
-    q: wp.array(dtype=vec3),
-    soup: Soup,
-    contacts: Contacts,
-    thickness: float,
+def batched_fixed_bvh_point_triangle_query(
+    pairs: wp.array(dtype=wp.vec2i),
+    body_vertex_offsets: wp.array(dtype=int), vertex_ids: wp.array(dtype=int),
+    body_triangle_offsets: wp.array(dtype=int), triangle_ids: wp.array(dtype=int),
+    triangle_bvh_ids: wp.array(dtype=wp.uint64), q: wp.array(dtype=vec3),
+    soup: Soup, contacts: Contacts, thickness: float,
 ):
-    k = wp.tid()
-    point = source_vertex_ids[k]
+    pair_index, local_source, direction = wp.tid()
+    pair = pairs[pair_index]
+    source_body = pair[direction]
+    target_body = pair[1 - direction]
+    source_begin = body_vertex_offsets[source_body]
+    source_count = body_vertex_offsets[source_body + 1] - source_begin
+    if local_source >= source_count:
+        return
+
+    point = vertex_ids[source_begin + local_source]
     target_a = _body_affine(q, target_body)
     target_inv = wp.inverse(target_a)
     target_p = q[target_body * 4]
     local_point = target_inv @ (soup.x_transformed[point] - target_p)
     padding = _inverse_padding(target_inv, scalar(2.0) * scalar(thickness))
     query = wp.bvh_query_aabb(
-        target_bvh,
+        triangle_bvh_ids[target_body],
         wp.vec3(local_point - vec3(padding)),
         wp.vec3(local_point + vec3(padding)),
     )
-
+    target_begin = body_triangle_offsets[target_body]
     local_id = int(0)
     while wp.bvh_query_next(query, local_id):
-        triangle = target_triangle_ids[local_id]
+        triangle = triangle_ids[target_begin + local_id]
         t0 = soup.triangles[3 * triangle]
         t1 = soup.triangles[3 * triangle + 1]
         t2 = soup.triangles[3 * triangle + 2]
@@ -340,8 +383,121 @@ def fixed_bvh_point_triangle_query(
             wp.vec3(soup.x_transformed[t2]),
         )
         if scalar(result[2]) < scalar(2.0) * scalar(thickness):
-            # Preserve the ordering used by point_triangle_collision.
             append(contacts, point, t1, t0, t2, thickness, point, triangle)
+
+
+@wp.kernel
+def compact_edge_query_tasks(
+    pairs: wp.array(dtype=wp.vec2i), body_edge_offsets: wp.array(dtype=int),
+    edge_ids: wp.array(dtype=int), tasks: wp.array(dtype=wp.vec2i),
+    task_count: wp.array(dtype=int),
+):
+    pair_index, local_source = wp.tid()
+    pair = pairs[pair_index]
+    source_body = pair[0]
+    source_begin = body_edge_offsets[source_body]
+    source_count = body_edge_offsets[source_body + 1] - source_begin
+    if local_source < source_count:
+        output = wp.atomic_add(task_count, 0, 1)
+        tasks[output] = wp.vec2i(edge_ids[source_begin + local_source], pair[1])
+
+
+@wp.kernel
+def compact_point_query_tasks(
+    pairs: wp.array(dtype=wp.vec2i), body_vertex_offsets: wp.array(dtype=int),
+    vertex_ids: wp.array(dtype=int), tasks: wp.array(dtype=wp.vec2i),
+    task_count: wp.array(dtype=int),
+):
+    pair_index, local_source, direction = wp.tid()
+    pair = pairs[pair_index]
+    source_body = pair[direction]
+    target_body = pair[1 - direction]
+    source_begin = body_vertex_offsets[source_body]
+    source_count = body_vertex_offsets[source_body + 1] - source_begin
+    if local_source < source_count:
+        output = wp.atomic_add(task_count, 0, 1)
+        tasks[output] = wp.vec2i(vertex_ids[source_begin + local_source], target_body)
+
+
+@wp.kernel
+def tiled_fixed_bvh_edge_edge_query(
+    tasks: wp.array(dtype=wp.vec2i), body_edge_offsets: wp.array(dtype=int),
+    edge_ids: wp.array(dtype=int), edge_bvh_ids: wp.array(dtype=wp.uint64),
+    q: wp.array(dtype=vec3), soup: Soup, contacts: Contacts, thickness: float,
+):
+    task_index, lane = wp.tid()
+    task = tasks[task_index]
+    source_edge = task[0]
+    target_body = task[1]
+    a0 = soup.edges[2 * source_edge]
+    a1 = soup.edges[2 * source_edge + 1]
+    target_a = _body_affine(q, target_body)
+    target_inv = wp.inverse(target_a)
+    target_p = q[target_body * 4]
+    p0 = target_inv @ (soup.x_transformed[a0] - target_p)
+    p1 = target_inv @ (soup.x_transformed[a1] - target_p)
+    padding = _inverse_padding(target_inv, scalar(2.0) * scalar(thickness))
+    query = wp.tile_bvh_query_aabb(
+        edge_bvh_ids[target_body],
+        wp.vec3(wp.min(p0, p1) - vec3(padding)),
+        wp.vec3(wp.max(p0, p1) + vec3(padding)),
+    )
+    result_tile = wp.tile_bvh_query_next(query)
+    target_begin = body_edge_offsets[target_body]
+    while wp.tile_max(result_tile)[0] >= 0:
+        local_id = wp.untile(result_tile)
+        if local_id >= 0:
+            target_edge = edge_ids[target_begin + local_id]
+            b0 = soup.edges[2 * target_edge]
+            b1 = soup.edges[2 * target_edge + 1]
+            result = wp.closest_point_edge_edge(
+                wp.vec3(soup.x_transformed[a0]), wp.vec3(soup.x_transformed[a1]),
+                wp.vec3(soup.x_transformed[b0]), wp.vec3(soup.x_transformed[b1]),
+                1.0e-6,
+            )
+            if scalar(result[2]) < scalar(2.0) * scalar(thickness):
+                append(contacts, a0, a1, b0, b1, thickness, source_edge, target_edge)
+        result_tile = wp.tile_bvh_query_next(query)
+
+
+@wp.kernel
+def tiled_fixed_bvh_point_triangle_query(
+    tasks: wp.array(dtype=wp.vec2i), body_triangle_offsets: wp.array(dtype=int),
+    triangle_ids: wp.array(dtype=int), triangle_bvh_ids: wp.array(dtype=wp.uint64),
+    q: wp.array(dtype=vec3), soup: Soup, contacts: Contacts, thickness: float,
+):
+    task_index, lane = wp.tid()
+    task = tasks[task_index]
+    point = task[0]
+    target_body = task[1]
+    target_a = _body_affine(q, target_body)
+    target_inv = wp.inverse(target_a)
+    target_p = q[target_body * 4]
+    local_point = target_inv @ (soup.x_transformed[point] - target_p)
+    padding = _inverse_padding(target_inv, scalar(2.0) * scalar(thickness))
+    query = wp.tile_bvh_query_aabb(
+        triangle_bvh_ids[target_body],
+        wp.vec3(local_point - vec3(padding)),
+        wp.vec3(local_point + vec3(padding)),
+    )
+    result_tile = wp.tile_bvh_query_next(query)
+    target_begin = body_triangle_offsets[target_body]
+    while wp.tile_max(result_tile)[0] >= 0:
+        local_id = wp.untile(result_tile)
+        if local_id >= 0:
+            triangle = triangle_ids[target_begin + local_id]
+            t0 = soup.triangles[3 * triangle]
+            t1 = soup.triangles[3 * triangle + 1]
+            t2 = soup.triangles[3 * triangle + 2]
+            result, unused_type = closest_point_triangle(
+                wp.vec3(soup.x_transformed[point]),
+                wp.vec3(soup.x_transformed[t0]),
+                wp.vec3(soup.x_transformed[t1]),
+                wp.vec3(soup.x_transformed[t2]),
+            )
+            if scalar(result[2]) < scalar(2.0) * scalar(thickness):
+                append(contacts, point, t1, t0, t2, thickness, point, triangle)
+        result_tile = wp.tile_bvh_query_next(query)
 
 
 class FixedBodyContactSolver(ContactSolverBase):
@@ -392,20 +548,53 @@ class FixedBodyContactSolver(ContactSolverBase):
             tri_upper_wp = wp.array(tri_upper, dtype=wp.vec3)
             self.fixed_triangle_bvhs.append((wp.Bvh(tri_lower_wp, tri_upper_wp), tri_lower_wp, tri_upper_wp))
 
+        def flatten_by_body(arrays):
+            counts = np.asarray([array.shape[0] for array in arrays], dtype=np.int32)
+            offsets = np.zeros(self.n_bodies + 1, dtype=np.int32)
+            offsets[1:] = np.cumsum(counts)
+            if offsets[-1]:
+                values = np.concatenate([array.numpy() for array in arrays]).astype(np.int32)
+            else:
+                values = np.zeros(0, dtype=np.int32)
+            return wp.array(offsets, dtype=int), wp.array(values, dtype=int), int(counts.max(initial=0))
+
+        self.fixed_vertex_offsets, self.fixed_vertex_ids_flat, self.fixed_max_vertices = flatten_by_body(
+            self.fixed_vertex_ids
+        )
+        self.fixed_edge_offsets, self.fixed_edge_ids_flat, self.fixed_max_edges = flatten_by_body(
+            self.fixed_edge_ids
+        )
+        self.fixed_triangle_offsets, self.fixed_triangle_ids_flat, self.fixed_max_triangles = flatten_by_body(
+            self.fixed_triangle_ids
+        )
+        self.fixed_edge_bvh_ids = wp.array(
+            np.asarray([entry[0].id for entry in self.fixed_edge_bvhs], dtype=np.uint64),
+            dtype=wp.uint64,
+        )
+        self.fixed_triangle_bvh_ids = wp.array(
+            np.asarray([entry[0].id for entry in self.fixed_triangle_bvhs], dtype=np.uint64),
+            dtype=wp.uint64,
+        )
+        max_body_pairs = self.n_bodies * (self.n_bodies - 1) // 2
+        self.fixed_body_pairs = wp.empty(max(max_body_pairs, 1), dtype=wp.vec2i)
+        self.fixed_body_pair_count = wp.zeros(1, dtype=int)
+        self.fixed_pair_cull_mode = "kernel"
+        self.fixed_query_mode = "scalar"
+        self.tile_query_threads = 32
+        self.fixed_edge_query_tasks = wp.empty(1, dtype=wp.vec2i)
+        self.fixed_point_query_tasks = wp.empty(1, dtype=wp.vec2i)
+        self.fixed_edge_query_task_count = wp.zeros(1, dtype=int)
+        self.fixed_point_query_task_count = wp.zeros(1, dtype=int)
+
         self.fixed_local_lower = wp.array(local_lower, dtype=vec3)
         self.fixed_local_upper = wp.array(local_upper, dtype=vec3)
         self.fixed_world_lower = wp.zeros(self.n_bodies, dtype=vec3)
         self.fixed_world_upper = wp.zeros(self.n_bodies, dtype=vec3)
         self.fixed_swept_min_det = wp.zeros(self.n_bodies, dtype=scalar)
-        self.fixed_ccd_counts = [wp.zeros(ids.shape[0], dtype=int) for ids in self.fixed_edge_ids]
-        self.fixed_ccd_offsets = [wp.zeros(ids.shape[0], dtype=int) for ids in self.fixed_edge_ids]
-        self.fixed_ccd_total = wp.zeros(1, dtype=int)
-        self.fixed_ccd_pairs = wp.empty(1024, dtype=wp.vec2i)
-        self.fixed_ccd_candidate_counts = []
         if hasattr(self, "abd_fixed"):
-            self.fixed_body_flags = self.abd_fixed.numpy().astype(bool)
+            self.fixed_body_flags_wp = self.abd_fixed
         else:
-            self.fixed_body_flags = np.zeros(self.n_bodies, dtype=bool)
+            self.fixed_body_flags_wp = wp.zeros(self.n_bodies, dtype=int)
 
     def _overlapping_body_pairs(self):
         wp.launch(
@@ -424,6 +613,69 @@ class FixedBodyContactSolver(ContactSolverBase):
                     pairs.append((a, b))
         return pairs
 
+    def _overlapping_body_pairs_gpu(self, tiled=True):
+        wp.launch(
+            affine_body_aabbs,
+            self.n_bodies,
+            inputs=[self.affine_q, self.fixed_local_lower, self.fixed_local_upper,
+                    self.fixed_world_lower, self.fixed_world_upper],
+        )
+        self.fixed_body_pair_count.zero_()
+        padding = scalar(2.0) * scalar(_thickness)
+        if tiled:
+            blocks = (self.n_bodies + BODY_PAIR_TILE - 1) // BODY_PAIR_TILE
+            wp.launch_tiled(
+                compact_overlapping_body_pairs_tiled,
+                dim=[blocks, blocks],
+                inputs=[self.fixed_world_lower, self.fixed_world_upper, self.n_bodies,
+                        padding, self.fixed_body_pairs, self.fixed_body_pair_count],
+                block_dim=BODY_PAIR_TILE,
+            )
+        else:
+            wp.launch(
+                compact_overlapping_body_pairs,
+                dim=(self.n_bodies, self.n_bodies),
+                inputs=[self.fixed_world_lower, self.fixed_world_upper, padding,
+                        self.fixed_body_pairs, self.fixed_body_pair_count],
+            )
+        return int(self.fixed_body_pair_count.numpy()[0])
+
+    @staticmethod
+    def _ensure_query_task_capacity(array, required):
+        if required <= array.shape[0]:
+            return array
+        return wp.empty(1 << (required - 1).bit_length(), dtype=wp.vec2i)
+
+    def _build_tiled_query_tasks(self, n_pairs):
+        edge_upper = n_pairs * self.fixed_max_edges
+        point_upper = n_pairs * self.fixed_max_vertices * 2
+        self.fixed_edge_query_tasks = self._ensure_query_task_capacity(
+            self.fixed_edge_query_tasks, edge_upper
+        )
+        self.fixed_point_query_tasks = self._ensure_query_task_capacity(
+            self.fixed_point_query_tasks, point_upper
+        )
+        self.fixed_edge_query_task_count.zero_()
+        self.fixed_point_query_task_count.zero_()
+        wp.launch(
+            compact_edge_query_tasks,
+            dim=(n_pairs, self.fixed_max_edges),
+            inputs=[self.fixed_body_pairs, self.fixed_edge_offsets,
+                    self.fixed_edge_ids_flat, self.fixed_edge_query_tasks,
+                    self.fixed_edge_query_task_count],
+        )
+        wp.launch(
+            compact_point_query_tasks,
+            dim=(n_pairs, self.fixed_max_vertices, 2),
+            inputs=[self.fixed_body_pairs, self.fixed_vertex_offsets,
+                    self.fixed_vertex_ids_flat, self.fixed_point_query_tasks,
+                    self.fixed_point_query_task_count],
+        )
+        return (
+            int(self.fixed_edge_query_task_count.numpy()[0]),
+            int(self.fixed_point_query_task_count.numpy()[0]),
+        )
+
     def _swept_overlapping_body_pairs(self, affine_dx):
         wp.launch(
             affine_swept_body_aabbs,
@@ -432,27 +684,31 @@ class FixedBodyContactSolver(ContactSolverBase):
                     self.fixed_local_upper, self.fixed_world_lower,
                     self.fixed_world_upper, self.fixed_swept_min_det],
         )
-        lower = self.fixed_world_lower.numpy()
-        upper = self.fixed_world_upper.numpy()
         min_det = self.fixed_swept_min_det.numpy()
         if np.any(min_det < 1.0e-8):
             return None
-        padding = 1.0e-7
-        pairs = []
-        for a in range(self.n_bodies):
-            for b in range(a + 1, self.n_bodies):
-                if np.all(lower[a] - padding <= upper[b]) and np.all(lower[b] - padding <= upper[a]):
-                    pairs.append((a, b))
-        return pairs
-
-    def _ensure_fixed_ccd_capacity(self, required):
-        if required <= self.fixed_ccd_pairs.shape[0]:
-            return
-        capacity = 1 << (required - 1).bit_length()
-        self.fixed_ccd_pairs = wp.empty(capacity, dtype=wp.vec2i)
+        self.fixed_body_pair_count.zero_()
+        if self.fixed_pair_cull_mode == "tile":
+            blocks = (self.n_bodies + BODY_PAIR_TILE - 1) // BODY_PAIR_TILE
+            wp.launch_tiled(
+                compact_overlapping_body_pairs_tiled,
+                dim=[blocks, blocks],
+                inputs=[self.fixed_world_lower, self.fixed_world_upper, self.n_bodies,
+                        scalar(1.0e-7), self.fixed_body_pairs, self.fixed_body_pair_count],
+                block_dim=BODY_PAIR_TILE,
+            )
+        else:
+            wp.launch(
+                compact_overlapping_body_pairs,
+                dim=(self.n_bodies, self.n_bodies),
+                inputs=[self.fixed_world_lower, self.fixed_world_upper, scalar(1.0e-7),
+                        self.fixed_body_pairs, self.fixed_body_pair_count],
+            )
+        n_pairs = int(self.fixed_body_pair_count.numpy()[0])
+        return n_pairs
 
     def collision_free_step(self, dx):
-        """Fixed-local-BVH CCD with compact EE candidate evaluation."""
+        """Fixed-local-BVH CCD with batched EE and PT evaluation."""
         if not hasattr(self, "abd_states"):
             return ContactSolverBase.collision_free_step(self, dx)
 
@@ -470,73 +726,25 @@ class FixedBodyContactSolver(ContactSolverBase):
                 return ContactSolverBase.collision_free_step(self, dx)
 
         self.ccd_toi.fill_(1.0)
-        self.fixed_ccd_candidate_counts = []
-        for a, b in body_pairs:
-            # EE is symmetric. Prefer a fixed target, otherwise keep the
-            # deterministic a->b orientation.
-            if self.fixed_body_flags[a] and not self.fixed_body_flags[b]:
-                source, target = b, a
-            else:
-                source, target = a, b
-            n_source_edges = self.fixed_edge_ids[source].shape[0]
-            counts = self.fixed_ccd_counts[source]
-            offsets = self.fixed_ccd_offsets[source]
-            target_bvh = self.fixed_edge_bvhs[target][0]
-
-            with self.profile_timer("fixed CCD EE traversal count"):
+        if body_pairs:
+            with self.profile_timer("fixed CCD EE query and TOI"):
                 wp.launch(
-                    count_fixed_bvh_ee_ccd_candidates,
-                    n_source_edges,
-                    inputs=[target_bvh.id, self.fixed_edge_ids[source], target,
-                            self.affine_q, self.abd_states.dx,
+                    batched_fixed_bvh_edge_edge_toi,
+                    dim=(body_pairs, self.fixed_max_edges),
+                    inputs=[self.fixed_body_pairs, self.fixed_body_flags_wp,
+                            self.fixed_edge_offsets, self.fixed_edge_ids_flat,
+                            self.fixed_edge_bvh_ids, self.affine_q, self.abd_states.dx,
                             self.soup.x_transformed, self.ccd_x1, self.soup.edges,
-                            self.fixed_local_lower, self.fixed_local_upper,
-                            padding, counts],
-                )
-            with self.profile_timer("fixed CCD EE scan"):
-                wp.utils.array_scan(counts, offsets, inclusive=False)
-                wp.launch(scanned_total, 1, inputs=[counts, offsets, self.fixed_ccd_total])
-            with self.profile_timer("fixed CCD candidate count transfer"):
-                n_candidates = int(self.fixed_ccd_total.numpy()[0])
-            self.fixed_ccd_candidate_counts.append(n_candidates)
-            self._ensure_fixed_ccd_capacity(n_candidates)
-            if n_candidates:
-                with self.profile_timer("fixed CCD EE traversal write"):
-                    wp.launch(
-                        write_fixed_bvh_ee_ccd_candidates,
-                        n_source_edges,
-                        inputs=[target_bvh.id, self.fixed_edge_ids[source],
-                                self.fixed_edge_ids[target], target,
-                                self.affine_q, self.abd_states.dx,
-                                self.soup.x_transformed, self.ccd_x1, self.soup.edges,
-                                self.fixed_local_lower, self.fixed_local_upper,
-                                padding, offsets, self.fixed_ccd_pairs],
-                    )
-                with self.profile_timer("fixed CCD EE polynomial TOI"):
-                    wp.launch(
-                        compact_ee_polynomial_toi,
-                        n_candidates,
-                        inputs=[self.soup.x_transformed, self.ccd_x1,
-                                self.soup.edges, self.fixed_ccd_pairs, self.ccd_toi],
-                    )
-
-            # PT is directional, so evaluate both point/triangle orientations.
-            with self.profile_timer("fixed CCD PT query and TOI"):
-                wp.launch(
-                    fixed_bvh_point_triangle_toi,
-                    self.fixed_vertex_ids[a].shape[0],
-                    inputs=[self.fixed_triangle_bvhs[b][0].id,
-                            self.fixed_vertex_ids[a], self.fixed_triangle_ids[b], b,
-                            self.affine_q, self.abd_states.dx,
-                            self.soup.x_transformed, self.ccd_x1, self.soup.triangles,
                             self.fixed_local_lower, self.fixed_local_upper,
                             padding, self.ccd_toi],
                 )
+            with self.profile_timer("fixed CCD PT query and TOI"):
                 wp.launch(
-                    fixed_bvh_point_triangle_toi,
-                    self.fixed_vertex_ids[b].shape[0],
-                    inputs=[self.fixed_triangle_bvhs[a][0].id,
-                            self.fixed_vertex_ids[b], self.fixed_triangle_ids[a], a,
+                    batched_fixed_bvh_point_triangle_toi,
+                    dim=(body_pairs, self.fixed_max_vertices, 2),
+                    inputs=[self.fixed_body_pairs, self.fixed_vertex_offsets,
+                            self.fixed_vertex_ids_flat, self.fixed_triangle_offsets,
+                            self.fixed_triangle_ids_flat, self.fixed_triangle_bvh_ids,
                             self.affine_q, self.abd_states.dx,
                             self.soup.x_transformed, self.ccd_x1, self.soup.triangles,
                             self.fixed_local_lower, self.fixed_local_upper,
@@ -551,38 +759,58 @@ class FixedBodyContactSolver(ContactSolverBase):
         """Run fixed-local-BVH DCD; CCD remains inherited and swept."""
         self.compute_V(ret=False)
         with self.profile_timer("fixed DCD object cull"):
-            pairs = self._overlapping_body_pairs()
+            n_pairs = self._overlapping_body_pairs_gpu(
+                tiled=self.fixed_pair_cull_mode == "tile"
+            )
 
         self.contacts_new.cnt.zero_()
         self.contacts_new.htable.fill_(-1)
         self.contacts_pt.cnt.zero_()
         self.contacts_pt.htable.fill_(-1)
 
+        n_edge_tasks = 0
+        n_point_tasks = 0
+        if n_pairs and self.fixed_query_mode == "tile":
+            with self.profile_timer("fixed DCD tile task compaction"):
+                n_edge_tasks, n_point_tasks = self._build_tiled_query_tasks(n_pairs)
+
         with self.profile_timer("fixed DCD EE queries"):
-            for a, b in pairs:
-                target_bvh = self.fixed_edge_bvhs[b][0]
+            if n_edge_tasks:
+                wp.launch_tiled(
+                    tiled_fixed_bvh_edge_edge_query,
+                    dim=[n_edge_tasks],
+                    inputs=[self.fixed_edge_query_tasks, self.fixed_edge_offsets,
+                            self.fixed_edge_ids_flat, self.fixed_edge_bvh_ids,
+                            self.affine_q, self.soup, self.contacts_new, _thickness],
+                    block_dim=self.tile_query_threads,
+                )
+            elif n_pairs and self.fixed_query_mode == "scalar":
                 wp.launch(
-                    fixed_bvh_edge_edge_query,
-                    self.fixed_edge_ids[a].shape[0],
-                    inputs=[target_bvh.id, self.fixed_edge_ids[a], self.fixed_edge_ids[b],
-                            b, self.affine_q, self.soup, self.contacts_new, _thickness],
+                    batched_fixed_bvh_edge_edge_query,
+                    dim=(n_pairs, self.fixed_max_edges),
+                    inputs=[self.fixed_body_pairs, self.fixed_edge_offsets,
+                            self.fixed_edge_ids_flat, self.fixed_edge_bvh_ids,
+                            self.affine_q, self.soup, self.contacts_new, _thickness],
                 )
 
         with self.profile_timer("fixed DCD PT queries"):
-            for a, b in pairs:
-                wp.launch(
-                    fixed_bvh_point_triangle_query,
-                    self.fixed_vertex_ids[a].shape[0],
-                    inputs=[self.fixed_triangle_bvhs[b][0].id, self.fixed_vertex_ids[a],
-                            self.fixed_triangle_ids[b], b, self.affine_q, self.soup,
-                            self.contacts_pt, _thickness],
+            if n_point_tasks:
+                wp.launch_tiled(
+                    tiled_fixed_bvh_point_triangle_query,
+                    dim=[n_point_tasks],
+                    inputs=[self.fixed_point_query_tasks, self.fixed_triangle_offsets,
+                            self.fixed_triangle_ids_flat, self.fixed_triangle_bvh_ids,
+                            self.affine_q, self.soup, self.contacts_pt, _thickness],
+                    block_dim=self.tile_query_threads,
                 )
+            elif n_pairs and self.fixed_query_mode == "scalar":
                 wp.launch(
-                    fixed_bvh_point_triangle_query,
-                    self.fixed_vertex_ids[b].shape[0],
-                    inputs=[self.fixed_triangle_bvhs[a][0].id, self.fixed_vertex_ids[b],
-                            self.fixed_triangle_ids[a], a, self.affine_q, self.soup,
-                            self.contacts_pt, _thickness],
+                    batched_fixed_bvh_point_triangle_query,
+                    dim=(n_pairs, self.fixed_max_vertices, 2),
+                    inputs=[self.fixed_body_pairs, self.fixed_vertex_offsets,
+                            self.fixed_vertex_ids_flat, self.fixed_triangle_offsets,
+                            self.fixed_triangle_ids_flat, self.fixed_triangle_bvh_ids,
+                            self.affine_q, self.soup, self.contacts_pt, _thickness],
                 )
 
         with self.profile_timer("contact count host transfer"):
@@ -596,7 +824,7 @@ class FixedBodyContactSolver(ContactSolverBase):
             self._grow_contact_list(self.contacts_pt, self.n_contacts_pt, point_triangle=True)
             return self.detect_collision()
         if verbose:
-            print(f"fixed BVH contacts: EE={self.n_contacts}, PT={self.n_contacts_pt}, body pairs={len(pairs)}")
+            print(f"fixed BVH contacts: EE={self.n_contacts}, PT={self.n_contacts_pt}, body pairs={n_pairs}")
 
 
 class FixedBVHAffineBodyDynamics(AffineBodyDynamics, FixedBodyContactSolver):
@@ -621,3 +849,14 @@ class FixedBVHScrewAndNut(FixedBVHAffineBodyDynamics):
             motors={0: (0.0, -np.pi, 0.0)},
             linear_solver=linear_solver,
         )
+
+
+class FixedBVHWreckingBalls(FixedBVHAffineBodyDynamics):
+    def __init__(self, h=0.01, body_limit=0, linear_solver="cg"):
+        super().__init__(
+            h,
+            linear_solver=linear_solver,
+            **wrecking_balls_scene_args(body_limit=body_limit),
+        )
+        self.max_newton_iterations = 1024
+        self.velocity_tolerance = 0.4

@@ -127,7 +127,7 @@ def symmetric_outer_product_psd_12(u: vec12, v: vec12):
     return result
 
 @wp.kernel
-def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), triplets: Triplets, b: wp.array(dtype = vec3)):
+def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), triplets: Triplets, b: wp.array(dtype = vec3), kappa: scalar):
     i = wp.tid()
     c = contacts[i]
     
@@ -141,14 +141,14 @@ def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         grad, hess = edge_edge_distance_gradient_hessian(x0, x1, x2, x3)
         d2 = dist * dist
         d02 = c.l0 * c.l0
-        barrier_grad = ipc_barrier_derivative(d2, d02, contact_stiffness)
-        barrier_hess = ipc_barrier_derivative2(d2, d02, contact_stiffness)
+        barrier_grad = ipc_barrier_derivative(d2, d02, kappa)
+        barrier_hess = ipc_barrier_derivative2(d2, d02, kappa)
         eps_x = ee_mollifier_threshold_rest(soup, c)
         mollifier = ee_mollifier_value(x0, x1, x2, x3, eps_x)
         mollifier_grad, mollifier_hess = ee_mollifier_gradient_hessian_psd(
             x0, x1, x2, x3, eps_x
         )
-        barrier = ipc_barrier(d2, d02, contact_stiffness)
+        barrier = ipc_barrier(d2, d02, kappa)
         barrier_grad_vec = barrier_grad * grad
         hess = mollifier * (barrier_hess * wp.outer(grad, grad) + barrier_grad * hess)
         hess += barrier * mollifier_hess
@@ -170,7 +170,7 @@ def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype
                 triplets.vals[i * 16 + ii * 4 + jj] = block
 
 @wp.kernel
-def contact_hessian_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), triplets: Triplets, b: wp.array(dtype = vec3), offset: int):
+def contact_hessian_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), triplets: Triplets, b: wp.array(dtype = vec3), offset: int, kappa: scalar):
     i = wp.tid()
     c = contacts[i]
     
@@ -188,8 +188,8 @@ def contact_hessian_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         grad, hess = point_triangle_distance_gradient_hessian(x0, x1, x2, x3)
         d2 = dist * dist
         d02 = c.l0 * c.l0
-        barrier_grad = ipc_barrier_derivative(d2, d02, contact_stiffness)
-        barrier_hess = ipc_barrier_derivative2(d2, d02, contact_stiffness)
+        barrier_grad = ipc_barrier_derivative(d2, d02, kappa)
+        barrier_hess = ipc_barrier_derivative2(d2, d02, kappa)
         hess = barrier_hess * wp.outer(grad, grad) + barrier_grad * hess
         # self.b stores force; compute_rhs later converts it to an energy gradient.
         grad *= -barrier_grad
@@ -216,6 +216,7 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         RodBCBase.__init__(self, h)
         self.soup.x_transformed = self.states.x
         ContactSolverBase.__init__(self)
+        self.contact_stiffness = scalar(contact_stiffness)
         self._ldlt_solver = None
         self._ldlt_collision_pattern = None
         self._ldlt_offsets = None
@@ -246,8 +247,8 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
                 self.collision_triplets.rows = wp.zeros((nnz,), dtype = int)
                 self.collision_triplets.cols = wp.zeros_like(self.collision_triplets.rows)
                 self.collision_triplets.vals = wp.zeros((nnz,), dtype = mat33)
-                wp.launch(contact_hessian_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, self.collision_triplets, self.b])
-                wp.launch(contact_hessian_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, self.collision_triplets, self.b, self.n_contacts])
+                wp.launch(contact_hessian_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, self.collision_triplets, self.b, self.contact_stiffness])
+                wp.launch(contact_hessian_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, self.collision_triplets, self.b, self.n_contacts, self.contact_stiffness])
 
                 self.collision_hessian = bsr_from_triplets(
                     self.n_nodes,
@@ -263,8 +264,8 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
             self.detect_collision()
         with self.profile_timer("collision energy kernels"):
             e = wp.zeros((1,), dtype = scalar)
-            wp.launch(contact_energy_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, e])
-            wp.launch(contact_energy_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, e])
+            wp.launch(contact_energy_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, e, self.contact_stiffness])
+            wp.launch(contact_energy_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, e, self.contact_stiffness])
         with self.profile_timer("energy host transfer"):
             energy_host = e.numpy()
         return energy_host[0] * self.h * self.h
@@ -334,7 +335,7 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         self._ldlt_solver.solve(self.b.ptr, self.states.dx.ptr)
 
 @wp.kernel
-def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar)):
+def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar), kappa: scalar):
     i = wp.tid()
     c = contacts[i]
     
@@ -346,15 +347,15 @@ def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype 
             soup.x_transformed[c.a1a2b1b2[0]], soup.x_transformed[c.a1a2b1b2[1]],
             soup.x_transformed[c.a1a2b1b2[2]], soup.x_transformed[c.a1a2b1b2[3]], eps_x
         )
-        energy = mollifier * ipc_barrier(dist * dist, c.l0 * c.l0, contact_stiffness)
+        energy = mollifier * ipc_barrier(dist * dist, c.l0 * c.l0, kappa)
         wp.atomic_add(e, 0, energy)
         
 @wp.kernel
-def contact_energy_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar)):
+def contact_energy_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar), kappa: scalar):
     i = wp.tid()
     c = contacts[i]
     dist, v0, v1 = fetch_dist_v0v1_pt(states, soup, c)
 
     if dist < c.l0:
-        energy = ipc_barrier(dist * dist, c.l0 * c.l0, contact_stiffness)
+        energy = ipc_barrier(dist * dist, c.l0 * c.l0, kappa)
         wp.atomic_add(e, 0, energy)

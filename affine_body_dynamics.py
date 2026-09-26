@@ -10,6 +10,7 @@ same map and makes every 3x3 contact block reduce through scalar Jacobian
 weights.  Collision detection, CCD, and IPC derivatives remain vertex based.
 """
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -221,7 +222,7 @@ class AffineBodyDynamics(RodComplexBC):
 
     def __init__(self, h, meshes, transforms=None, fixed_bodies=None, density=1000.0,
                  affine_stiffness=1.0e8, gravity=(0.0, 0.0, 0.0), motors=None,
-                 linear_solver=None):
+                 linear_solver=None, contact_kappa=None):
         self._abd_initializing = True
         self._density = float(density)
         self._fixed_body_spec = set(fixed_bodies or [])
@@ -229,6 +230,8 @@ class AffineBodyDynamics(RodComplexBC):
         if transforms is None:
             transforms = [np.eye(4, dtype=np.float64) for _ in meshes]
         super().__init__(h, list(map(str, meshes)), transforms)
+        if contact_kappa is not None:
+            self.contact_stiffness = scalar(contact_kappa)
         self.disable_self_collision = True
         self.linear_solver = linear_solver
 
@@ -400,10 +403,11 @@ class AffineBodyDynamics(RodComplexBC):
                 vertex_triplets.vals = wp.zeros(n_vertex_blocks, dtype=mat33)
                 vertex_force = wp.zeros(self.n_nodes, dtype=vec3)
                 wp.launch(contact_hessian_ee, self.n_contacts,
-                          inputs=[self.states, self.soup, self.contacts_new.list, vertex_triplets, vertex_force])
+                          inputs=[self.states, self.soup, self.contacts_new.list, vertex_triplets,
+                                  vertex_force, self.contact_stiffness])
                 wp.launch(contact_hessian_pt, self.n_contacts_pt,
                           inputs=[self.states, self.soup, self.contacts_pt.list, vertex_triplets,
-                                  vertex_force, self.n_contacts])
+                                  vertex_force, self.n_contacts, self.contact_stiffness])
                 self.reduced_contact_force.zero_()
                 wp.launch(_reduce_contact_force, self.n_nodes,
                           inputs=[vertex_force, self.xcs, self.body, self.abd_fixed,
@@ -611,6 +615,61 @@ class AffineBodyDynamics(RodComplexBC):
 
 
 SCREW_ASSET_DIR = Path(r"D:\ref_repos\warp-ipc\assets\sim_data\trimesh\screw-and-nut")
+WRECKING_ASSET_DIR = Path(r"D:\ref_repos\warp-ipc\assets\sim_data\tetmesh")
+WRECKING_SCENE_JSON = Path(
+    r"D:\ref_repos\warp-ipc\assets\python\6_wrecking_balls\wrecking_ball.json"
+)
+
+
+def _euler_xyz_transform(rotation, position):
+    rx, ry, rz = np.radians(rotation)
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.array([
+        [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+        [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+        [-sy, cy * sx, cy * cx],
+    ])
+    transform[:3, 3] = np.asarray(position, dtype=np.float64)
+    return transform
+
+
+def wrecking_balls_scene_args(body_limit=0, include_ground=True):
+    """Build the mesh/transform list from warp-ipc sample 6's JSON scene."""
+    with WRECKING_SCENE_JSON.open() as stream:
+        objects = json.load(stream)
+    if body_limit and body_limit > 0:
+        objects = objects[:int(body_limit)]
+
+    meshes = []
+    transforms = []
+    fixed_bodies = []
+    for body, obj in enumerate(objects):
+        meshes.append(WRECKING_ASSET_DIR / obj["mesh"])
+        transforms.append(_euler_xyz_transform(
+            obj.get("rotation", (0.0, 0.0, 0.0)),
+            obj.get("position", (0.0, 0.0, 0.0)),
+        ))
+        if obj.get("is_dof_fixed", False):
+            fixed_bodies.append(body)
+
+    if include_ground:
+        ground = np.eye(4, dtype=np.float64)
+        ground[1, 3] = -1.0
+        meshes.append(Path(__file__).resolve().parent / "assets" / "plane.obj")
+        transforms.append(ground)
+        fixed_bodies.append(len(meshes) - 1)
+
+    return dict(
+        meshes=meshes,
+        transforms=transforms,
+        fixed_bodies=fixed_bodies,
+        gravity=(0.0, -9.8, 0.0),
+        affine_stiffness=1.0e8,
+        contact_kappa=1.0e10,
+    )
 
 
 class ScrewSpin(AffineBodyDynamics):
@@ -631,3 +690,16 @@ class ScrewAndNut(AffineBodyDynamics):
             motors={0: (0.0, -np.pi, 0.0)},
             linear_solver=linear_solver,
         )
+
+
+class WreckingBalls(AffineBodyDynamics):
+    """Large ABD chain, ball, and block wall from warp-ipc sample 6."""
+
+    def __init__(self, h=0.01, body_limit=0, linear_solver="cg"):
+        super().__init__(
+            h,
+            linear_solver=linear_solver,
+            **wrecking_balls_scene_args(body_limit=body_limit),
+        )
+        self.max_newton_iterations = 1024
+        self.velocity_tolerance = 0.4

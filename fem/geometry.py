@@ -235,26 +235,42 @@ class TOBJComplex(SimComplexBase):
         
         transforms = self.transforms 
         meshes_filename = self.meshes_filename
+        mesh_cache = {}
 
         for f, trans in zip(meshes_filename, transforms):
-            if f.endswith(".tobj"):
-                v, t = import_tobj(f)
-                ff = igl.boundary_facets(t)  
-                ff, _ = igl.bfs_orient(ff)
-                c, _ = igl.orientable_patches(ff)
-                ff, _ = igl.orient_outward(v, ff, c)
-                v = (np.hstack((v, np.ones((v.shape[0], 1), dtype = scalar))) @ trans.T)[:, :3]
+            if f not in mesh_cache:
+                if f.endswith(".tobj"):
+                    v, t = import_tobj(f)
+                    ff = igl.boundary_facets(t)
+                    ff, _ = igl.bfs_orient(ff)
+                    c, _ = igl.orientable_patches(ff)
+                    ff, _ = igl.orient_outward(v, ff, c)
+                elif f.endswith(".mesh"):
+                    v, t, _ = igl.read_mesh(f)
+                    ff = np.zeros((0, 3), int)
+                elif f.endswith(".msh"):
+                    # libigl's Python read_msh only exposes surface elements
+                    # for these Gmsh 2.2 files. meshio preserves the tetrahedra.
+                    import meshio
+                    msh = meshio.read(f)
+                    v = np.asarray(msh.points, dtype=np.float64)
+                    t = np.asarray(msh.cells_dict["tetra"], dtype=int)
+                    ff = igl.boundary_facets(t)
+                    ff, _ = igl.bfs_orient(ff)
+                    c, _ = igl.orientable_patches(ff)
+                    ff, _ = igl.orient_outward(v, ff, c)
+                elif f.endswith(".obj"):
+                    v, tc, _, ff, _, _ = igl.read_obj(f)
+                    t = np.zeros((0, 4), int)
+                else:
+                    raise ValueError(f"Unsupported mesh format: {f}")
+                mesh_cache[f] = (v, t, ff)
+            v, t, ff = mesh_cache[f]
 
-            elif f.endswith(".mesh"):
-                v, t, _ = igl.read_mesh(f)
-                ff = np.zeros((0, 3), int)
-            elif f.endswith(".obj"):
-                v, tc, _, ff, _, _ = igl.read_obj(f)
-                t = np.zeros((0, 4), int)
-                if tc is not None and tc.shape[0]:
-                    if tc.shape[1] == 2:
-                        tc = np.hstack((tc, np.zeros((tc.shape[0], 1), dtype = scalar)))
-                    uv = np.vstack((uv, tc))
+            # Each instance gets its own world transform even when its source
+            # mesh is shared by hundreds of ABD bodies.
+            v4 = np.hstack((v, np.ones((v.shape[0], 1), dtype=np.float64)))
+            v = (v4 @ trans.T)[:, :3]
 
             e = igl.edges(ff)
             yield v, e, ff, t, None
