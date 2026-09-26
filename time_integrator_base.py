@@ -7,9 +7,11 @@ from fem.params import NewtonState, FEMMesh, gravity, gravity_np
 from fem.fem import tet_kernel, tet_kernel_sparse, Triplets, psi
 from warp.sparse import *
 from warp.optim.linear import bicgstab, cg
-from dxslv import CUSolverDevice
+from dxslv import CUSolverDevice, CUSolverDeviceF
 from warp.fem.linalg import array_axpy
 from scalar_types import *
+
+DirectSolverDevice = CUSolverDeviceF if USE_FLOAT32 else CUSolverDevice
 
 vel_tol = 5e-2
 eps = 3e-4
@@ -488,7 +490,7 @@ class RodBCBase:
             device=self.A.device,
         )
 
-        direct_solver = CUSolverDevice(
+        direct_solver = DirectSolverDevice(
             offsets.ptr, columns.ptr, values.ptr, n, scalar_nnz
         )
         direct_solver.analyze_pattern()
@@ -533,7 +535,7 @@ class RodBCBase:
                     accepted = True
                     break
                 alpha *= 0.5
-                if alpha <= np.finfo(np.float64).eps * max(1.0, upper_bound):
+                if alpha <= scalar_epsilon * max(1.0, upper_bound):
                     break
 
             if not accepted:

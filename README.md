@@ -21,6 +21,9 @@ Wrecking ball:
 ```
 python wrecking_balls.py --dcd fixed --pair-cull kernel --fixed-query scalar
 ```
+Precision is selected by `USE_FLOAT32` in `scalar_types.py`. It defaults to
+`True`, so the simulation, energy reductions, and direct solver all use fp32.
+Set it to `False` and restart Python to use fp64.
 
 ## References
 

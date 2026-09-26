@@ -304,7 +304,7 @@ def linearize_constraints(
             )
         else:
             grad_squared, hessian_unused = edge_edge_distance_gradient_hessian(
-                x0, x1, x2, x3
+                x0, x1, x2, x3, eps_x
             )
             closest = wp.closest_point_edge_edge(
                 wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3), 1.0e-6

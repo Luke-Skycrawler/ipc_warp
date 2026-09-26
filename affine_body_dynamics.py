@@ -18,8 +18,7 @@ import warp as wp
 from warp.optim.linear import cg
 from warp.sparse import bsr_axpy, bsr_from_triplets, bsr_zeros
 
-from dxslv import CUSolverDevice
-from scalar_types import scalar, vec3, mat33
+from scalar_types import energy_scalar, scalar, scalar_epsilon, vec3, mat33
 from fem.fem import Triplets
 from fem.params import NewtonState
 import time_integrator_base as time_integrator
@@ -193,28 +192,28 @@ def _reduce_contact_hessian(src: Triplets, rest: wp.array(dtype=vec3),
 @wp.kernel
 def _body_energy(state: ABDState, mass: wp.array(dtype=mat33), volume: wp.array(dtype=scalar),
                  stiffness: wp.array(dtype=scalar), fixed: wp.array(dtype=int), h2: scalar,
-                 inertia: wp.array(dtype=scalar), ortho: wp.array(dtype=scalar)):
+                 inertia: wp.array(dtype=energy_scalar), ortho: wp.array(dtype=energy_scalar)):
     b = wp.tid()
     if fixed[b] != 0:
         return
-    e = scalar(0.0)
+    e = energy_scalar(0.0)
     for i in range(4):
         di = state.q[b * 4 + i] - state.q_tilde[b * 4 + i]
         for j in range(4):
             dj = state.q[b * 4 + j] - state.q_tilde[b * 4 + j]
-            e = e + scalar(0.5) * wp.dot(di, mass[b * 16 + i * 4 + j] @ dj)
+            e = e + energy_scalar(scalar(0.5) * wp.dot(di, mass[b * 16 + i * 4 + j] @ dj))
     wp.atomic_add(inertia, 0, e)
 
-    oe = scalar(0.0)
+    oe = energy_scalar(0.0)
     for i in range(1, 4):
         ai = state.q[b * 4 + i]
         d = wp.dot(ai, ai) - scalar(1.0)
-        oe = oe + d * d
+        oe = oe + energy_scalar(d * d)
         for j in range(i + 1, 4):
             aj = state.q[b * 4 + j]
             d = wp.dot(ai, aj)
-            oe = oe + scalar(2.0) * d * d
-    wp.atomic_add(ortho, 0, stiffness[b] * volume[b] * h2 * oe)
+            oe = oe + energy_scalar(scalar(2.0) * d * d)
+    wp.atomic_add(ortho, 0, energy_scalar(stiffness[b] * volume[b] * h2) * oe)
 
 
 class AffineBodyDynamics(RodComplexBC):
@@ -486,7 +485,7 @@ class AffineBodyDynamics(RodComplexBC):
             self._ldlt_solver.refactorize(self._ldlt_values.ptr)
             self.ldlt_refactorizations += 1
         else:
-            self._ldlt_solver = CUSolverDevice(
+            self._ldlt_solver = time_integrator.DirectSolverDevice(
                 self._ldlt_offsets.ptr,
                 self._ldlt_columns.ptr,
                 self._ldlt_values.ptr,
@@ -555,7 +554,7 @@ class AffineBodyDynamics(RodComplexBC):
                     accepted = True
                     break
                 alpha *= 0.5
-                if alpha <= np.finfo(np.float64).eps * max(1.0, upper):
+                if alpha <= scalar_epsilon * max(1.0, upper):
                     break
             if not accepted:
                 wp.copy(self.abd_states.q, q_start)
@@ -578,8 +577,8 @@ class AffineBodyDynamics(RodComplexBC):
 
     def _energies(self):
         with self.profile_timer("ABD body energy"):
-            inertia = wp.zeros(1, dtype=scalar)
-            ortho = wp.zeros(1, dtype=scalar)
+            inertia = wp.zeros(1, dtype=energy_scalar)
+            ortho = wp.zeros(1, dtype=energy_scalar)
             wp.launch(_body_energy, self.n_bodies,
                       inputs=[self.abd_states, self.abd_mass, self.abd_volume,
                               self.abd_stiffness, self.abd_fixed, self.h * self.h,

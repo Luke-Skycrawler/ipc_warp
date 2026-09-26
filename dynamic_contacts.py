@@ -46,7 +46,9 @@ def embed_point_edge_distance(p: vec3, e0: vec3, e1: vec3, op: int, oe0: int, oe
     return grad, hess
 
 @wp.func
-def edge_edge_distance_gradient_hessian(x0: vec3, x1: vec3, x2: vec3, x3: vec3):
+def edge_edge_distance_gradient_hessian(
+    x0: vec3, x1: vec3, x2: vec3, x3: vec3, parallel_eps: scalar
+):
     dab = wp.closest_point_edge_edge(wp.vec3(x0), wp.vec3(x1), wp.vec3(x2), wp.vec3(x3), 1.0e-6)
     s = scalar(dab[0])
     t = scalar(dab[1])
@@ -82,6 +84,26 @@ def edge_edge_distance_gradient_hessian(x0: vec3, x1: vec3, x2: vec3, x3: vec3):
             ob = 3
             pb = x3
         return embed_point_edge_distance(pb, x0, x1, ob, 0, 1)
+
+    edge_a = x1 - x0
+    edge_b = x3 - x2
+    cross = wp.cross(edge_a, edge_b)
+    if parallel_eps > scalar(0.0) and wp.dot(cross, cross) < parallel_eps:
+        # The analytical EE eigensystem contains an inverse Gram matrix and
+        # is undefined for parallel edges.  Choose the closest endpoint/edge
+        # feature, matching IPC's lower-dimensional parallel fallback.
+        ds0 = s
+        ds1 = scalar(1.0) - s
+        dt0 = t
+        dt1 = scalar(1.0) - t
+        minimum = wp.min(wp.min(ds0, ds1), wp.min(dt0, dt1))
+        if minimum == ds0:
+            return embed_point_edge_distance(x0, x2, x3, 0, 2, 3)
+        if minimum == ds1:
+            return embed_point_edge_distance(x1, x2, x3, 1, 2, 3)
+        if minimum == dt0:
+            return embed_point_edge_distance(x2, x0, x1, 2, 0, 1)
+        return embed_point_edge_distance(x3, x0, x1, 3, 0, 1)
 
     return x_to_grad_nsd_hess_ee(x0, x1, x2, x3)
 
@@ -138,21 +160,36 @@ def contact_hessian_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype
         x1 = states.x[c.a1a2b1b2[1]]
         x2 = states.x[c.a1a2b1b2[2]]
         x3 = states.x[c.a1a2b1b2[3]]
-        grad, hess = edge_edge_distance_gradient_hessian(x0, x1, x2, x3)
+        eps_x = ee_mollifier_threshold_rest(soup, c)
+        edge_a = x1 - x0
+        edge_b = x3 - x2
+        edge_cross = wp.cross(edge_a, edge_b)
+        near_parallel = (
+            eps_x > scalar(0.0)
+            and wp.dot(edge_cross, edge_cross) < eps_x
+        )
+        grad, hess = edge_edge_distance_gradient_hessian(
+            x0, x1, x2, x3, eps_x
+        )
         d2 = dist * dist
         d02 = c.l0 * c.l0
         barrier_grad = ipc_barrier_derivative(d2, d02, kappa)
         barrier_hess = ipc_barrier_derivative2(d2, d02, kappa)
-        eps_x = ee_mollifier_threshold_rest(soup, c)
         mollifier = ee_mollifier_value(x0, x1, x2, x3, eps_x)
         mollifier_grad, mollifier_hess = ee_mollifier_gradient_hessian_psd(
             x0, x1, x2, x3, eps_x
         )
         barrier = ipc_barrier(d2, d02, kappa)
         barrier_grad_vec = barrier_grad * grad
-        hess = mollifier * (barrier_hess * wp.outer(grad, grad) + barrier_grad * hess)
-        hess += barrier * mollifier_hess
-        hess += symmetric_outer_product_psd_12(mollifier_grad, barrier_grad_vec)
+        if near_parallel:
+            # The exact EE and mollifier second derivatives are singular in
+            # the parallel limit.  PT/PE constraints carry the missing
+            # curvature; retain the finite PSD Gauss-Newton EE contribution.
+            hess = mollifier * barrier_hess * wp.outer(grad, grad)
+        else:
+            hess = mollifier * (barrier_hess * wp.outer(grad, grad) + barrier_grad * hess)
+            hess += barrier * mollifier_hess
+            hess += symmetric_outer_product_psd_12(mollifier_grad, barrier_grad_vec)
         # self.b stores force; compute_rhs later converts it to an energy gradient.
         grad = -(mollifier * barrier_grad_vec + barrier * mollifier_grad)
 
@@ -263,7 +300,7 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         with self.profile_timer("collision energy detect"):
             self.detect_collision()
         with self.profile_timer("collision energy kernels"):
-            e = wp.zeros((1,), dtype = scalar)
+            e = wp.zeros((1,), dtype=energy_scalar)
             wp.launch(contact_energy_ee, dim = (self.n_contacts, ), inputs = [self.states, self.soup, self.contacts_new.list, e, self.contact_stiffness])
             wp.launch(contact_energy_pt, dim = (self.n_contacts_pt, ), inputs = [self.states, self.soup, self.contacts_pt.list, e, self.contact_stiffness])
         with self.profile_timer("energy host transfer"):
@@ -319,7 +356,7 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
             self._ldlt_solver.refactorize(self._ldlt_values.ptr)
             self.ldlt_refactorizations += 1
         else:
-            self._ldlt_solver = CUSolverDevice(
+            self._ldlt_solver = DirectSolverDevice(
                 self._ldlt_offsets.ptr,
                 self._ldlt_columns.ptr,
                 self._ldlt_values.ptr,
@@ -335,7 +372,7 @@ class RodComplexBC(RodBCBase, RodComplex, ContactSolverBase):
         self._ldlt_solver.solve(self.b.ptr, self.states.dx.ptr)
 
 @wp.kernel
-def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar), kappa: scalar):
+def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = energy_scalar), kappa: scalar):
     i = wp.tid()
     c = contacts[i]
     
@@ -348,14 +385,14 @@ def contact_energy_ee(states: NewtonState, soup: Soup, contacts: wp.array(dtype 
             soup.x_transformed[c.a1a2b1b2[2]], soup.x_transformed[c.a1a2b1b2[3]], eps_x
         )
         energy = mollifier * ipc_barrier(dist * dist, c.l0 * c.l0, kappa)
-        wp.atomic_add(e, 0, energy)
+        wp.atomic_add(e, 0, energy_scalar(energy))
         
 @wp.kernel
-def contact_energy_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = scalar), kappa: scalar):
+def contact_energy_pt(states: NewtonState, soup: Soup, contacts: wp.array(dtype = XConstraint), e: wp.array(dtype = energy_scalar), kappa: scalar):
     i = wp.tid()
     c = contacts[i]
     dist, v0, v1 = fetch_dist_v0v1_pt(states, soup, c)
 
     if dist < c.l0:
         energy = ipc_barrier(dist * dist, c.l0 * c.l0, kappa)
-        wp.atomic_add(e, 0, energy)
+        wp.atomic_add(e, 0, energy_scalar(energy))
