@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 from warp.optim.linear import cg
-from warp.sparse import bsr_axpy, bsr_from_triplets, bsr_zeros
+from warp.sparse import bsr_from_triplets, bsr_zeros
 
 from scalar_types import energy_scalar, scalar, scalar_epsilon, vec3, mat33
 from fem.fem import Triplets
@@ -165,7 +165,8 @@ def _add_contact_gradient(gradient: wp.array(dtype=vec3), force: wp.array(dtype=
 
 @wp.kernel
 def _reduce_contact_hessian(src: Triplets, rest: wp.array(dtype=vec3),
-                            body: wp.array(dtype=int), fixed: wp.array(dtype=int), dst: Triplets):
+                            body: wp.array(dtype=int), fixed: wp.array(dtype=int),
+                            scale: scalar, dst: Triplets):
     tid = wp.tid()
     source = tid // 16
     local = tid - source * 16
@@ -186,7 +187,7 @@ def _reduce_contact_hessian(src: Triplets, rest: wp.array(dtype=vec3),
         ca = rest[vi][a - 1]
     if c > 0:
         cc = rest[vj][c - 1]
-    dst.vals[tid] = ca * cc * src.vals[source]
+    dst.vals[tid] = scale * ca * cc * src.vals[source]
 
 
 @wp.kernel
@@ -273,10 +274,11 @@ class AffineBodyDynamics(RodComplexBC):
 
         self.reduced_b = wp.zeros(n_q, dtype=vec3)
         self.reduced_contact_force = wp.zeros(n_q, dtype=vec3)
-        self.base_triplets = Triplets()
-        self.base_triplets.rows = wp.zeros(self.n_bodies * 16, dtype=int)
-        self.base_triplets.cols = wp.zeros_like(self.base_triplets.rows)
-        self.base_triplets.vals = wp.zeros(self.n_bodies * 16, dtype=mat33)
+        self.vertex_contact_force = wp.zeros(self.n_nodes, dtype=vec3)
+        self.vertex_contact_triplets = None
+        self.vertex_contact_triplet_capacity = 0
+        self.system_triplets = None
+        self.system_triplet_capacity = 0
         self._abd_initializing = False
         self._sync_vertices()
         self._prepare_prediction()
@@ -381,50 +383,125 @@ class AffineBodyDynamics(RodComplexBC):
         self._cached_line_search_energy = None
         RodBCBase.step(self)
 
+    @staticmethod
+    def _triplet_view(storage, begin, count):
+        view = Triplets()
+        end = begin + count
+        view.rows = storage.rows[begin:end]
+        view.cols = storage.cols[begin:end]
+        view.vals = storage.vals[begin:end]
+        return view
+
+    @staticmethod
+    def _grown_capacity(current, required):
+        capacity = max(current, 1)
+        while capacity < required:
+            capacity *= 2
+        return capacity
+
+    def _reserve_contact_assembly(self, vertex_blocks, system_triplets):
+        if vertex_blocks > 0 and (
+            self.vertex_contact_triplets is None
+            or vertex_blocks > self.vertex_contact_triplet_capacity
+        ):
+            capacity = self._grown_capacity(
+                self.vertex_contact_triplet_capacity, vertex_blocks
+            )
+            storage = Triplets()
+            storage.rows = wp.empty(capacity, dtype=int)
+            storage.cols = wp.empty(capacity, dtype=int)
+            storage.vals = wp.empty(capacity, dtype=mat33)
+            self.vertex_contact_triplets = storage
+            self.vertex_contact_triplet_capacity = capacity
+        if system_triplets > self.system_triplet_capacity:
+            capacity = self._grown_capacity(
+                self.system_triplet_capacity, system_triplets
+            )
+            storage = Triplets()
+            storage.rows = wp.empty(capacity, dtype=int)
+            storage.cols = wp.empty(capacity, dtype=int)
+            storage.vals = wp.empty(capacity, dtype=mat33)
+            self.system_triplets = storage
+            self.system_triplet_capacity = capacity
+
     def compute_A(self):
         with self.profile_timer("compute A"):
             with self.profile_timer("detect collision"):
                 self.detect_collision()
-            self.reduced_b.zero_()
-            wp.launch(_assemble_body_system, self.n_bodies * 16,
-                      inputs=[self.abd_states, self.abd_mass, self.abd_volume,
-                              self.abd_stiffness, self.abd_fixed, self.h * self.h,
-                              self.base_triplets, self.reduced_b])
-            self.A = bsr_from_triplets(self.n_bodies * 4, self.n_bodies * 4,
-                                       self.base_triplets.rows, self.base_triplets.cols,
-                                       self.base_triplets.vals)
+            base_nnz = self.n_bodies * 16
+            n_vertex_blocks = (self.n_contacts + self.n_contacts_pt) * 16
+            reduced_nnz = n_vertex_blocks * 16
+            total_nnz = base_nnz + reduced_nnz
+            with self.profile_timer("contact buffer preparation"):
+                self._reserve_contact_assembly(n_vertex_blocks, total_nnz)
+                system_triplets = self._triplet_view(
+                    self.system_triplets, 0, total_nnz
+                )
+                base_triplets = self._triplet_view(
+                    self.system_triplets, 0, base_nnz
+                )
+                vertex_triplets = None
+                reduced = None
+                if n_vertex_blocks > 0:
+                    vertex_triplets = self._triplet_view(
+                        self.vertex_contact_triplets, 0, n_vertex_blocks
+                    )
+                    reduced = self._triplet_view(
+                        self.system_triplets, base_nnz, reduced_nnz
+                    )
+                    vertex_triplets.rows.zero_()
+                    vertex_triplets.cols.zero_()
+                    vertex_triplets.vals.zero_()
+                    self.vertex_contact_force.zero_()
+            with self.profile_timer("ABD body hessian kernel"):
+                self.reduced_b.zero_()
+                wp.launch(_assemble_body_system, self.n_bodies * 16,
+                          inputs=[self.abd_states, self.abd_mass, self.abd_volume,
+                                  self.abd_stiffness, self.abd_fixed, self.h * self.h,
+                                  base_triplets, self.reduced_b])
 
             with self.profile_timer("compute contact hessian"):
-                n_vertex_blocks = (self.n_contacts + self.n_contacts_pt) * 16
-                vertex_triplets = Triplets()
-                vertex_triplets.rows = wp.zeros(n_vertex_blocks, dtype=int)
-                vertex_triplets.cols = wp.zeros(n_vertex_blocks, dtype=int)
-                vertex_triplets.vals = wp.zeros(n_vertex_blocks, dtype=mat33)
-                vertex_force = wp.zeros(self.n_nodes, dtype=vec3)
-                wp.launch(contact_hessian_ee, self.n_contacts,
-                          inputs=[self.states, self.soup, self.contacts_new.list, vertex_triplets,
-                                  vertex_force, self.contact_stiffness])
-                wp.launch(contact_hessian_pt, self.n_contacts_pt,
-                          inputs=[self.states, self.soup, self.contacts_pt.list, vertex_triplets,
-                                  vertex_force, self.n_contacts, self.contact_stiffness])
                 self.reduced_contact_force.zero_()
-                wp.launch(_reduce_contact_force, self.n_nodes,
-                          inputs=[vertex_force, self.xcs, self.body, self.abd_fixed,
-                                  self.reduced_contact_force])
-                wp.launch(_add_contact_gradient, self.n_bodies * 4,
-                          inputs=[self.reduced_b, self.reduced_contact_force, self.h * self.h])
-
-                reduced_nnz = n_vertex_blocks * 16
-                reduced = Triplets()
-                reduced.rows = wp.zeros(reduced_nnz, dtype=int)
-                reduced.cols = wp.zeros(reduced_nnz, dtype=int)
-                reduced.vals = wp.zeros(reduced_nnz, dtype=mat33)
-                wp.launch(_reduce_contact_hessian, reduced_nnz,
-                          inputs=[vertex_triplets, self.xcs, self.body, self.abd_fixed, reduced])
-                self.collision_hessian = bsr_from_triplets(
-                    self.n_bodies * 4, self.n_bodies * 4,
-                    reduced.rows, reduced.cols, reduced.vals)
-                bsr_axpy(self.collision_hessian, self.A, self.h * self.h, 1.0)
+                if n_vertex_blocks > 0:
+                    if self.n_contacts > 0:
+                        with self.profile_timer("contact EE hessian kernel"):
+                            wp.launch(
+                                contact_hessian_ee, self.n_contacts,
+                                inputs=[self.states, self.soup,
+                                        self.contacts_new.list, vertex_triplets,
+                                        self.vertex_contact_force,
+                                        self.contact_stiffness],
+                            )
+                    if self.n_contacts_pt > 0:
+                        with self.profile_timer("contact PT hessian kernel"):
+                            wp.launch(
+                                contact_hessian_pt, self.n_contacts_pt,
+                                inputs=[self.states, self.soup,
+                                        self.contacts_pt.list, vertex_triplets,
+                                        self.vertex_contact_force, self.n_contacts,
+                                        self.contact_stiffness],
+                            )
+                    with self.profile_timer("contact force reduction"):
+                        wp.launch(
+                            _reduce_contact_force, self.n_nodes,
+                            inputs=[self.vertex_contact_force, self.xcs, self.body,
+                                    self.abd_fixed, self.reduced_contact_force],
+                        )
+                with self.profile_timer("contact gradient accumulation"):
+                    wp.launch(_add_contact_gradient, self.n_bodies * 4,
+                              inputs=[self.reduced_b, self.reduced_contact_force,
+                                      self.h * self.h])
+                if n_vertex_blocks > 0:
+                    with self.profile_timer("contact hessian reduction kernel"):
+                        wp.launch(_reduce_contact_hessian, reduced_nnz,
+                                  inputs=[vertex_triplets, self.xcs, self.body,
+                                          self.abd_fixed, self.h * self.h, reduced])
+                with self.profile_timer("combined hessian BSR assembly"):
+                    self.A = bsr_from_triplets(
+                        self.n_bodies * 4, self.n_bodies * 4,
+                        system_triplets.rows, system_triplets.cols,
+                        system_triplets.vals)
+                    self.collision_hessian = self.A
         self.b = self.reduced_b
 
     def compute_rhs(self):
